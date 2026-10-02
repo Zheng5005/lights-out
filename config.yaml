@@ -1,0 +1,56 @@
+# lights-out — dark factory configuration
+#
+# This file is the documented configuration contract. The same file is read by
+# the GitHub Action in Phase 7 (LIGHTS_OUT_CONFIG: ./config.yaml).
+#
+# Path resolution order:
+#   1. $LIGHTS_OUT_CONFIG
+#   2. ./config.yaml
+#
+# Unknown keys are rejected on purpose: a typo must fail loudly instead of
+# silently falling back to a default (for example a misspelled
+# concurrency_limit would otherwise disable the concurrency cap).
+#
+# The file is required. A missing file is a hard error (exit code 1).
+
+# Master switch. When false the factory exits silently without doing anything.
+# The configuration is still validated at load time even when disabled, so a
+# broken config never hides behind `enabled: false`.
+enabled: false
+
+# Target repository in "owner/repo" form. Required, exactly one slash.
+repo: "Zheng5005/lights-out"
+
+# Maximum number of issues allowed to carry labels.in_progress at the same
+# time. Must be > 0. Default when omitted: 2.
+concurrency_limit: 2
+
+# Maximum number of issues claimed per UTC day. Must be > 0.
+# Default when omitted: 2.
+daily_limit: 2
+
+# GitHub labels driving the issue state machine.
+labels:
+  # Opt-in marker placed by a human. Input to the system; never removed
+  # by the factory.
+  trigger: dark-factory
+  # Lock plus concurrency counter. Applied right before work starts and removed
+  # on every terminal outcome.
+  in_progress: factory-in-progress
+  # Terminal failure state: the issue stops being re-claimed until a human
+  # decides what to do.
+  blocked: factory-blocked
+
+# How work is dispatched to a coding agent.
+agent:
+  # Herdr dispatcher binary. Default when omitted: herdr.
+  dispatcher: herdr
+  # Invocation mode. Default when omitted: headless.
+  mode: headless
+  # Herdr agent kind: agy, claude, gemini, ... Default when omitted: agy.
+  kind: agy
+
+# Git worktree settings used by the Phase 4 agent runner.
+worktree:
+  # Base ref new worktrees are created from. Default when omitted: main.
+  base: main
