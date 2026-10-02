@@ -10,3 +10,7 @@ coverage.html
 # must never be committed.
 .env
 .env.*
+
+# Generated agent-tooling metadata (skill registry and its cache). Machine-local
+# and regenerated on demand; not project source.
+.atl/
