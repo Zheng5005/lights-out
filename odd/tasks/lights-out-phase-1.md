@@ -90,14 +90,44 @@ Known test coupling (accepted for now): `TestShippedConfigExampleIsValid` reads
 `../../config.yaml`, and the default-path test uses `os.Chdir` (`t.Chdir` needs
 Go 1.24, module pins 1.22). Both must stay non-parallel.
 
-### Blocker: no git repository
+## Git state
 
-`gentle-ai review status` returns `applicability: "unrelated"`, `paths: []`, and
-`base_tree: 4b825dc...` (git's empty-tree hash). Cause: the project has no git
-repo, so all 9 files are untracked and there is no tracked diff to review. RDD is
-enabled (global), and ODD closes each task with a work-unit commit — both are
-blocked until the user decides on git initialization.
+```
+a7848e8  chore: bootstrap repository with design docs and ignore rules   (main)
+1bc171d  feat(config): load, validate and prove out the factory configuration  (feat/phase-1-config)
+```
+
+Authored lines in `1bc171d`: 904 (over the ~400 planning heuristic; driven by the
+417-line test suite and this tracking doc — not cut, per the no-shrinking policy).
+`review_due: true`, `review_due_reason: slice_budget_reached`.
+
+## Review transaction (in flight, NOT acknowledged)
+
+| Field | Value |
+|---|---|
+| Lineage | `review-7fcbda282eefd06f` |
+| Target | `sha256:1cdbf16756d24d040f4fa189155f37c111f05c0dcb879768cbe0732e7cd63ed5` |
+| Base ref | `ce73965b6a6e358147a43b5478e21060942cfab5` |
+| Risk | medium, 7 files, 904 lines |
+| State | `action: consent_required`, `blocking: true` |
+
+START was executed verbatim and returned the `gentle-ai.review-integration.consent/v3`
+envelope. The envelope is awaiting a human decision.
+
+**BLOCKED:** this runtime exposes no `question` tool, so the classified native
+consent UI is unavailable. The v3 contract forbids using chat text as consent and
+forbids a chat-token fallback. No provider continuation may be invoked from chat.
+
+Both provider-owned invocations are preserved verbatim in
+`/tmp/opencode/review-start.json`. To unblock, run one of them directly in a
+terminal (this is a human action, not an agent action):
+
+- Grant: the invocation under `choices[answer="granted"].invocation`
+- Decline: the invocation under `choices[answer="declined"].invocation`
+
+Then re-query with the exact bound STATUS (lineage + target tokens above) and
+follow its returned `next_transition`.
 
 ## Next step
-Await user decision on git init, then either commit Phase 1 as a work unit and
-run the native review, or declare Phase 1 delivered outside git.
+Human decides the review consent. Phase 1 code itself is complete and verified;
+delivery remains a separate decision under ordinary repository policy.
