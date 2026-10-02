@@ -1,0 +1,12 @@
+# Compiled binary. The module path and the binary share the name, so a plain
+# `go build` from the repo root drops it here.
+/lights-out
+
+# Test and coverage output (Phase 8).
+*.out
+coverage.html
+
+# Local credentials. The factory reads GITHUB_TOKEN from the environment; it
+# must never be committed.
+.env
+.env.*
