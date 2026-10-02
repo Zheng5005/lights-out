@@ -93,15 +93,21 @@ Go 1.24, module pins 1.22). Both must stay non-parallel.
 ## Git state
 
 ```
-a7848e8  chore: bootstrap repository with design docs and ignore rules   (main)
-1bc171d  feat(config): load, validate and prove out the factory configuration  (feat/phase-1-config)
+a7848e8  chore: bootstrap repository with design docs and ignore rules
+1bc171d  feat(config): load, validate and prove out the factory configuration
+6bce82b  chore: ignore generated .atl tooling metadata
+9c77147  docs: record the Phase 1 git layout and review transaction state
 ```
+
+`main` = `feat/phase-1-config` = `9c77147` (fast-forwarded, no merge commit).
+Remote `origin` = https://github.com/Zheng5005/lights-out (PUBLIC), `main`
+tracking `origin/main`.
 
 Authored lines in `1bc171d`: 904 (over the ~400 planning heuristic; driven by the
 417-line test suite and this tracking doc — not cut, per the no-shrinking policy).
 `review_due: true`, `review_due_reason: slice_budget_reached`.
 
-## Review transaction (in flight, NOT acknowledged)
+## Review transaction — closed without a record
 
 | Field | Value |
 |---|---|
@@ -109,25 +115,27 @@ Authored lines in `1bc171d`: 904 (over the ~400 planning heuristic; driven by th
 | Target | `sha256:1cdbf16756d24d040f4fa189155f37c111f05c0dcb879768cbe0732e7cd63ed5` |
 | Base ref | `ce73965b6a6e358147a43b5478e21060942cfab5` |
 | Risk | medium, 7 files, 904 lines |
-| State | `action: consent_required`, `blocking: true` |
+| Outcome | **No review ran.** No receipt, no acknowledgement, authority never burned. |
 
-START was executed verbatim and returned the `gentle-ai.review-integration.consent/v3`
-envelope. The envelope is awaiting a human decision.
+START returned a `gentle-ai.review-integration.consent/v3` envelope
+(`action: consent_required`, `blocking: true`). This runtime exposes no
+`question` tool, so the required native consent UI was unavailable and the v3
+contract forbids substituting chat text as consent. The human then chose to merge
+without a review. That is a legitimate candidate-scoped skip under ordinary
+repository policy — it costs nothing, and the next candidate asks again.
 
-**BLOCKED:** this runtime exposes no `question` tool, so the classified native
-consent UI is unavailable. The v3 contract forbids using chat text as consent and
-forbids a chat-token fallback. No provider continuation may be invoked from chat.
+Consequence to remember: Phase 1 shipped **unreviewed**. Phase 2 candidates should
+not assume a passing receipt on this codebase.
 
-Both provider-owned invocations are preserved verbatim in
-`/tmp/opencode/review-start.json`. To unblock, run one of them directly in a
-terminal (this is a human action, not an agent action):
+## Known gaps carried into Phase 2
 
-- Grant: the invocation under `choices[answer="granted"].invocation`
-- Decline: the invocation under `choices[answer="declined"].invocation`
-
-Then re-query with the exact bound STATUS (lineage + target tokens above) and
-follow its returned `next_transition`.
+- No `README.md`. The plan's project structure lists one, but no phase creates it,
+  so a freshly published repo has no landing page.
+- `config.yaml` ships `enabled: false` and targets `Zheng5005/lights-out`. It must
+  be set deliberately before any real run.
+- `internal/config/config_test.go` reads `../../config.yaml`, coupling tests to the
+  repo layout, and the default-path test uses `os.Chdir`. Both must stay
+  non-parallel.
 
 ## Next step
-Human decides the review consent. Phase 1 code itself is complete and verified;
-delivery remains a separate decision under ordinary repository policy.
+Phase 1 is closed and published. Phase 2 (GitHub client) is unblocked.
