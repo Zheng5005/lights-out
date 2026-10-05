@@ -118,14 +118,110 @@ never appear in any log, error, or test failure output.**
 
 ## Tasks
 
-- [ ] T1 Add deps: `go-github/v69 v69.2.0`, `joho/godotenv v1.5.1`
-- [ ] T2 `types.go` — `Issue`, `PullRequestSpec`, `PullRequest`, `Client` interface, mappers from go-github structs
-- [ ] T3 `query.go` — pure search-query builders (no I/O)
-- [ ] T4 `tokens.go` — resolution order + Bearer `RoundTripper`
-- [ ] T5 `client.go` — the six methods; `RemoveLabel` 404-is-success (D7)
-- [ ] T6 `client_test.go` — query builder tests + `httptest`-backed client tests (no network)
-- [ ] T7 Live read-only smoke test, build-tagged `live` so it never runs in CI
-- [ ] T8 `.env.example` + README note on required token permissions
+- [x] T1 Add deps: `go-github/v69 v69.2.0`, `joho/godotenv v1.5.1`
+- [x] T2 `types.go` — `Issue`, `PullRequestSpec`, `PullRequest`, `Client` interface, mappers from go-github structs
+- [x] T3 `query.go` — pure search-query builders (no I/O)
+- [x] T4 `tokens.go` — resolution order + Bearer `RoundTripper`
+- [x] T5 `client.go` — the six methods; `RemoveLabel` 404-is-success (D7)
+- [x] T6 tests — query builder tests + `httptest`-backed client tests (no network)
+- [x] T7 Live read-only smoke test, build-tagged `live` so it never runs in CI
+- [x] T8 `.env.example` + required token permissions documented
+
+## Progress log
+
+### T1–T8 complete (writer: `complete`, parent spot check: clean)
+
+Verification evidence (parent re-ran, real output):
+
+```
+go build ./...                                    -> exit=0
+go vet ./...                                      -> exit=0
+go test -count=1 ./...                            -> 111 passed, 3 packages
+go test -race ./...                               -> clean
+go test -tags live -run TestLive ./internal/github/ -> 2 passed (read-only)
+```
+
+Live verification (read-only, authorized): **1 claim candidate** — issue `#2`
+"Testing Lights out", labels `dark-factory`, created `2026-10-04T00:00:01Z`.
+In-progress count: **1** (`concurrency_limit: 2`). Token resolved from the `.env`
+file; the value was never printed. No mutating method was called.
+
+Parent spot checks beyond the suite:
+
+```
+merge-capability audit   -> only the test asserting its absence; no Merge method
+token-leak audit          -> only env var NAMES; no values, in code or fixtures
+.env staged?              -> no
+.env.example values       -> placeholders only, no token-shaped string
+.env tracked by git?      -> no (matched by .gitignore:11)
+```
+
+### Real bug caught by TDD
+
+The writer implemented `RemoveLabel` naively first and the D7 test failed at
+runtime with a genuine GitHub 404 (`Label does not exist`). Fixed to treat 404 as
+success. This is exactly the FR4 failure mode the design predicted.
+
+### Deviations from this document
+
+| # | Deviation | Reason |
+|---|---|---|
+| 1 | `go get` rewrote `go 1.22` → `go 1.22.0` | Canonicalization by Go, not a bump — go-github v69.2.0 declares `go 1.22.0`. The ≥1.23 ceiling (D4) was never crossed. |
+| 2 | `go get` alone was insufficient | It writes only the direct module; `go-querystring` needs a separate `go mod tidy`. |
+| 3 | `.gitignore` gained `!.env.example` | `.gitignore:12` `.env.*` silently hid `.env.example`, making T8 impossible. |
+| 4 | `godotenv.Read` instead of `godotenv.Load` | `Read` returns a map rather than mutating the process env; otherwise resolving a token would pollute the whole test binary's environment. D5 precedence is unchanged. |
+| 5 | Query tests live in `query_test.go`, not `client_test.go` | Co-location with `query.go`; T6's file split was a suggestion. |
+| 6 | Live test asserts ordering, not candidate count | Count is external repo state — asserting ≥1 would fail whenever the queue empties and train readers to ignore failures. Criterion 7 is satisfied in fact (1 candidate observed), not by assertion. |
+| 7 | `cmd/lights-out/main.go` untouched | No task required a smoke-test command; the `live` test already satisfies the exit criterion. |
+| 8 | Exported `WithHTTPClient` added then removed | Untested and unused; D9's aversion to speculative surface applies. `WithBaseURL` stays (tests use it). |
+
+### Carried into Phase 6/7 — action required
+
+- **`.env` resolution is CWD-relative.** A scheduler or GitHub Action running
+  from any directory other than the repo root will silently fail to find the
+  token. Phase 6/7 must either run from the repo root or set an absolute
+  `LIGHTS_OUT_ENV_FILE`. The live test failed once for exactly this reason.
+- **`RemoveLabelForIssue` does not URL-escape the label** (go-github behavior).
+  A configured label containing a space or slash would target the wrong URL on
+  that one call. Shipped labels are safe; documented rather than papered over.
+- **PR body / `Closes #<N>` is not Phase 2's job** (plan task 4 vs. the
+  interface signature — see "Explicitly deferred"). Phase 5 composes it.
+
+## Git state
+
+```
+main                = 9917ec5
+feat/phase-2-github-client = babac01  (this work, unmerged)
+```
+
+Base ref (branch point): `9917ec5`. Authored lines: 2151 — over the ~400
+planning heuristic, driven by 1290 lines of tests. Not cut, per the
+no-shrinking policy. `review_due: true`, `review_due_reason: slice_budget_reached`,
+risk `medium`.
+
+> Correction to the Phase 1 doc: its review table lists base ref `9c77147`. That
+> was correct when written, but `9917ec5` landed afterwards and is the real
+> branch point. Assessing against `9c77147` wrongly pulled the Phase 1 doc
+> commit into this candidate's scope.
+
+## Review transaction — open, blocked on consent
+
+| Field | Value |
+|---|---|
+| Lineage | `review-a19ad28b3f74a468` |
+| Target | `sha256:70c1cb5aeaebf0652d34591341553f992bc28891b44e1aba26f24994bca6f5d4` |
+| Base ref | `9917ec5` |
+| Risk | medium, 14 files, 2151 lines |
+| Outcome | **No review ran.** START returned `consent_required` (`blocking: true`). |
+
+This runtime exposes no `question` tool, so the v3 consent envelope cannot be
+presented natively, and the contract forbids substituting chat text as consent.
+Authority is frozen and unburned; the transaction stays open.
+
+## Next step
+
+Human decision on consent, then Phase 3 (Daily Counter) — which is independent of
+Phase 2 and can be started in either order.
 
 ## Explicitly deferred
 
