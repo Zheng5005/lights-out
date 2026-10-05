@@ -19,7 +19,7 @@
 enabled: false
 
 # Target repository in "owner/repo" form. Required, exactly one slash.
-repo: "Zheng5005/lights-out"
+repo: "Zheng5005/Spotify-clone-frontend-focus-"
 
 # Maximum number of issues allowed to carry labels.in_progress at the same
 # time. Must be > 0. Default when omitted: 2.

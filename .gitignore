@@ -10,6 +10,10 @@ coverage.html
 # must never be committed.
 .env
 .env.*
+# The template is the one exception: it carries placeholders instead of a
+# secret, and it is the only tracked description of the expected keys. Without
+# this negation the rule above would silently hide it from the repository.
+!.env.example
 
 # Generated agent-tooling metadata (skill registry and its cache). Machine-local
 # and regenerated on demand; not project source.
