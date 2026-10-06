@@ -202,3 +202,28 @@ Probe files were created, run, and deleted; they are not part of the commit.
 ## Next step
 Work-unit commit on `feat/phase-3-daily-counter`, then `review assess` against
 `main`. Push remains a human decision.
+
+## Review outcome
+
+`review assess --base-ref 7525af6 --committed-only` returned:
+
+| Field | Value |
+|---|---|
+| risk | `medium` |
+| review_due | `true` |
+| review_due_reason | `slice_budget_reached` |
+| changed_lines | 751 |
+
+The preflight STATUS then returned `kind: stop`, `reason_code: rdd_disabled`.
+`gentle-ai review mode status` confirms receipt-driven development is
+`off (decided by global)` — it was `on` during Phase 1, so the switch changed
+between Phase 2 and Phase 3.
+
+Per the switch contract the mode was **not** reactivated: it is user-owned and
+may only be turned on explicitly by the human. Phase 3 therefore closes under
+ordinary repository policy. Assessment tier recorded as **`disabled/unmanaged`**,
+not as an approval — a disabled review gate is never a passing review.
+
+Baseline before this phase: `7525af6`. Authored lines: 751 (over the ~400
+planning heuristic, driven by 335 lines of tests and 204 lines of this document;
+not cut).
