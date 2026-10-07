@@ -11,6 +11,10 @@
 // In headless operation an agent reports "done" rather than "idle": the
 // "idle" status requires the agent's tab to be seen by the focused UI, which
 // a headless factory session never provides.
+//
+// Calling Probe up front is the factory's fail-fast connectivity check
+// (plan Open Decision #3: assume the server is running, but fail fast if it
+// is not).
 package herdr
 
 import (
@@ -31,10 +35,13 @@ import (
 const maxMessageRunes = 500
 
 // Fixed flags ReadAgent always sends: the agent's recent pane output with
-// escape sequences unwrapped, capped at 120 lines.
+// escape sequences unwrapped, capped at 120 lines. ReadAgentVisible instead
+// pins the visible source: the agent's current rendered screen, the only
+// read herdr serves while the agent is blocked on a startup dialog.
 const (
-	readSource = "recent-unwrapped"
-	readLines  = "120"
+	readSource    = "recent-unwrapped"
+	readSourceVis = "visible"
+	readLines     = "120"
 )
 
 // ErrServerUnavailable is wrapped by CommandError when the Herdr server for
@@ -89,11 +96,22 @@ type execFunc func(ctx context.Context, args ...string) (stdout, stderr []byte, 
 
 // HerdrClient is the factory-facing contract, one method per herdr command.
 type HerdrClient interface {
+	// Probe verifies the pinned session is reachable with one cheap
+	// read-only command (`agent list`) through the normal envelope path. It
+	// returns nil when the session answers; a missing session surfaces as
+	// ErrServerUnavailable (wrapped) with an actionable message. The factory
+	// calls Probe before any work: this is the plan's "assume the server is
+	// running, but fail fast if it is not".
+	Probe(ctx context.Context) error
 	// CreateWorktree creates a worktree for branch off base with cwd as its
 	// working directory and returns the ids needed to drive the new session.
 	CreateWorktree(ctx context.Context, cwd, branch, base string) (WorktreeInfo, error)
-	// RemoveWorktree removes the worktree identified by worktreeID.
-	RemoveWorktree(ctx context.Context, worktreeID string) error
+	// RemoveWorktree removes the worktree whose live workspace is identified
+	// by workspaceID (`worktree remove --workspace <id>`). Per the observed
+	// 0.9.3 contract the call also closes that workspace, so cleanup must
+	// call this instead of a separate close; removing an already-closed
+	// workspace fails with workspace_not_found.
+	RemoveWorktree(ctx context.Context, workspaceID string) error
 	// CloseWorkspace closes the workspace identified by workspaceID.
 	CloseWorkspace(ctx context.Context, workspaceID string) error
 	// SplitPane splits paneID in direction with cwd as the new pane's working
@@ -109,13 +127,25 @@ type HerdrClient interface {
 	WaitAgent(ctx context.Context, target string, until []string, timeout time.Duration) (string, error)
 	// ReadAgent returns the agent's recent output text.
 	ReadAgent(ctx context.Context, target string) (string, error)
+	// ReadAgentVisible returns the agent's CURRENT rendered screen (visible
+	// source). Unlike ReadAgent's recent-unwrapped read, visible works while
+	// the agent is blocked: it is the dialog-evidence read used to verify
+	// that a blocked startup is exactly the trust prompt before answering it.
+	ReadAgentVisible(ctx context.Context, target string) (string, error)
+	// SendKeys sends logical terminal keys to the target agent (e.g. "enter",
+	// "up", "esc", "ctrl+c"). It is the recovery path for a blocked startup
+	// dialog: herdr keeps a blocked agent reachable for read and send-keys
+	// until detection reports idle. Keys use herdr key-combo syntax; the CLI
+	// validates them before writing any bytes.
+	SendKeys(ctx context.Context, target string, keys ...string) error
 }
 
 // WorktreeInfo carries the ids of a freshly created worktree: the workspace,
-// tab, and root pane the factory drives, plus the worktree id and checkout
-// path when herdr reports them.
+// tab, and root pane the factory drives, plus the checkout path when herdr
+// reports it. The freshly created worktree's identity is its live workspace
+// id — herdr 0.9.3 has no separate worktree id, so WorkspaceID is the handle
+// RemoveWorktree needs.
 type WorktreeInfo struct {
-	ID          string // worktree id, when reported
 	WorkspaceID string
 	TabID       string
 	RootPaneID  string // the pane to split for the agent
@@ -143,6 +173,25 @@ func New(session string) *Client {
 // real binary from tests.
 func NewWithRunner(session string, run execFunc) *Client {
 	return &Client{session: session, run: run}
+}
+
+// Probe verifies the pinned session is reachable with one cheap read-only
+// command (`agent list`) through the normal envelope path. It returns nil
+// when the session answers; a missing session surfaces as ErrServerUnavailable
+// (wrapped) with an actionable message. The factory calls Probe before any
+// work: this is the plan's "assume the server is running, but fail fast if it
+// is not".
+func (c *Client) Probe(ctx context.Context) error {
+	_, err := c.execute(ctx, "agent list", "agent", "list")
+	if err == nil {
+		return nil
+	}
+	var cmdErr *CommandError
+	if errors.As(err, &cmdErr) && errors.Is(err, ErrServerUnavailable) {
+		return fmt.Errorf("herdr session %q is not running (start it or fix agent.session): %s: %w",
+			c.session, cmdErr.Message, ErrServerUnavailable)
+	}
+	return err
 }
 
 // runHerdr runs the herdr binary from PATH synchronously, keeping stdout and
@@ -251,8 +300,12 @@ func truncateRunes(s string, max int) string {
 
 // CreateWorktree creates a worktree for branch off base with cwd as its
 // working directory and returns the workspace, tab, and root pane the factory
-// drives (RootPaneID is the pane to split for the agent), plus the worktree
-// id and checkout path when herdr reports them.
+// drives (RootPaneID is the pane to split for the agent), plus the checkout
+// path when herdr reports them. The factory creates throwaway worktrees of
+// the user's own repository and must run headless, so the worktree is trusted
+// at creation with --trust-repository: without it the freshly created
+// untrusted worktree makes the spawned agent block on a TUI trust prompt
+// before the first prompt can be answered.
 //
 // Extraction accepts BOTH the flattened snake_case keys observed on herdr's
 // live list endpoints and the nested workspace/tab/root_pane objects the
@@ -266,6 +319,7 @@ func (c *Client) CreateWorktree(ctx context.Context, cwd, branch, base string) (
 		"--cwd", cwd,
 		"--branch", branch,
 		"--base", base,
+		"--trust-repository",
 	}
 	result, err := c.execute(ctx, "worktree create", rest...)
 	if err != nil {
@@ -274,9 +328,15 @@ func (c *Client) CreateWorktree(ctx context.Context, cwd, branch, base string) (
 	return extractWorktreeInfo(result), nil
 }
 
-// RemoveWorktree removes the worktree identified by worktreeID.
-func (c *Client) RemoveWorktree(ctx context.Context, worktreeID string) error {
-	rest := []string{"worktree", "remove", worktreeID}
+// RemoveWorktree removes the worktree whose live workspace is identified by
+// workspaceID: the CLI takes NO positional argument, only
+// `worktree remove --workspace <id>`, because a worktree has no separate id
+// in 0.9.3 — the live workspace id IS the removal handle. Per the observed
+// 0.9.3 contract the same call also closes that workspace, so cleanup must
+// call this instead of a separate close; removal of an already-closed
+// workspace fails with workspace_not_found.
+func (c *Client) RemoveWorktree(ctx context.Context, workspaceID string) error {
+	rest := []string{"worktree", "remove", "--workspace", workspaceID}
 	_, err := c.execute(ctx, "worktree remove", rest...)
 	return err
 }
@@ -367,12 +427,84 @@ func (c *Client) WaitAgent(ctx context.Context, target string, until []string, t
 // ReadAgent returns the agent's recent output text, read with the fixed
 // package flags: readLines unwrapped lines of the pane's recent output.
 func (c *Client) ReadAgent(ctx context.Context, target string) (string, error) {
-	rest := []string{"agent", "read", target, "--source", readSource, "--lines", readLines}
-	result, err := c.execute(ctx, "agent read", rest...)
-	if err != nil {
-		return "", err
+	return c.readAgentOutput(ctx, target, readSource, readLines)
+}
+
+// ReadAgentVisible returns the agent's CURRENT rendered screen
+// (`agent read <target> --source visible`). Unlike ReadAgent's
+// recent-unwrapped read, the visible source is served while the agent is
+// blocked on a startup dialog, so this is the dialog-evidence read the
+// factory uses to verify that a blocked startup is exactly the trust prompt
+// before answering it.
+func (c *Client) ReadAgentVisible(ctx context.Context, target string) (string, error) {
+	return c.readAgentOutput(ctx, target, readSourceVis, "")
+}
+
+// readAgentOutput runs `agent read <target> --source <source> [--lines N]`
+// and returns the agent's terminal text. herdr 0.9.3 prints the terminal
+// text as raw UTF-8 on stdout with exit 0 (success is NOT a JSON envelope);
+// error paths print a JSON envelope on stderr with exit 1. Extraction is
+// tolerant, in this order:
+//
+//  1. error + stderr JSON error envelope → *CommandError (server code);
+//  2. error + bare *exec.ExitError → *CommandError with the trimmed stderr
+//     snippet (the process error when stderr is empty);
+//  3. error of any other kind → wrapped so errors.Is keeps working;
+//  4. stdout JSON envelope → shared extractReadOutput (content/text/output
+//     fallback);
+//  5. stdout non-JSON → the raw text trimmed of trailing newlines (the live
+//     success shape, and the dialog-evidence read for blocked agents).
+func (c *Client) readAgentOutput(ctx context.Context, target, source, lines string) (string, error) {
+	rest := []string{"agent", "read", target, "--source", source}
+	if lines != "" {
+		rest = append(rest, "--lines", lines)
 	}
-	return extractReadOutput(result), nil
+	args := c.argv(rest)
+
+	stdout, stderr, err := c.run(ctx, args...)
+
+	if err != nil {
+		var env envelope
+		if json.Unmarshal(stderr, &env) == nil && env.Error != nil {
+			return "", newCommandError("agent read", env.Error.Code, env.Error.Message, args)
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			message := strings.TrimSpace(string(stderr))
+			if message == "" {
+				message = err.Error()
+			}
+			return "", newCommandError("agent read", "", message, args)
+		}
+		return "", fmt.Errorf("herdr agent read: %w", err)
+	}
+
+	// First try the normal JSON envelope path (fakes and most states).
+	var env envelope
+	if json.Unmarshal(stdout, &env) == nil {
+		if env.Error != nil {
+			return "", newCommandError("agent read", env.Error.Code, env.Error.Message, args)
+		}
+		return extractReadOutput(env.Result), nil
+	}
+
+	// Tolerant fallback: live herdr returns the terminal text as raw UTF-8
+	// on stdout, for both recent-unwrapped and visible reads.
+	text := strings.TrimRight(string(stdout), "\r\n")
+	return text, nil
+}
+
+// SendKeys sends logical terminal keys ("enter", "up", "esc", "ctrl+c", ...)
+// to the target agent, each key appended verbatim after the target in
+// `agent send-keys <target> <keys...>`. It is the recovery path for a
+// blocked startup dialog: herdr keeps a blocked agent reachable for read and
+// send-keys until detection reports idle, and the CLI validates the keys
+// before writing any bytes.
+func (c *Client) SendKeys(ctx context.Context, target string, keys ...string) error {
+	rest := []string{"agent", "send-keys", target}
+	rest = append(rest, keys...)
+	_, err := c.execute(ctx, "agent send-keys", rest...)
+	return err
 }
 
 // fieldString returns the first key among keys whose value is a non-empty
@@ -432,8 +564,10 @@ func firstString(m map[string]json.RawMessage, nestedKey string, keys ...string)
 }
 
 // extractWorktreeInfo pulls the WorktreeInfo fields out of a worktree create
-// result, accepting both the flattened keys and the nested objects. Missing
-// ids yield zero values rather than an error — see CreateWorktree.
+// result, accepting both the flattened keys and the nested objects. There is
+// no worktree id to extract — herdr 0.9.3 has none; the live workspace id is
+// the worktree's identity. Missing ids yield zero values rather than an
+// error — see CreateWorktree.
 func extractWorktreeInfo(result json.RawMessage) WorktreeInfo {
 	var info WorktreeInfo
 	m, ok := resultObject(result)
@@ -443,7 +577,6 @@ func extractWorktreeInfo(result json.RawMessage) WorktreeInfo {
 	info.WorkspaceID = firstString(m, "workspace", "workspace_id")
 	info.TabID = firstString(m, "tab", "tab_id")
 	info.RootPaneID = firstString(m, "root_pane", "pane_id", "root_pane_id")
-	info.ID = firstString(m, "worktree", "worktree_id")
 	info.Path = firstString(m, "worktree", "path", "worktree_path")
 	return info
 }
@@ -466,13 +599,30 @@ func extractPaneID(result json.RawMessage) (string, bool) {
 	return "", false
 }
 
-// extractStatus returns the settled status token from a prompt/wait result:
-// the "status" key, else the "result" key, else — when the result is a plain
-// JSON string — the string itself. ok is false when no non-empty token
-// exists; an empty token would silently break the factory's state matching,
-// so the caller turns that into an error.
+// extractStatus returns the settled status token from a prompt/wait result.
+//
+// The LIVE herdr 0.9.3 shape for `agent wait` and `agent prompt --wait` is a
+// NESTED object: {"result":{"agent":{"agent":"agy","agent_status":"done",...}}}
+// — the settled agent object, whose status token lives at
+// result.agent.agent_status. Observed agent_status values: done, idle,
+// blocked, working, unknown. "blocked" is a real settled state: the agent is
+// up but showing a dialog (e.g. the first-command permission prompt), and a
+// blocked prompt is NOT a prompt failure.
+//
+// Tried in this order:
+//  1. result.agent.agent_status (the live nested shape),
+//  2. the flat "status" / "result" keys (kept for synthetic/older envelopes),
+//  3. when the result is a plain JSON string, the string itself (unchanged).
+//
+// ok is false when no non-empty token exists; an empty token would silently
+// break the factory's state matching, so the caller turns that into an error.
 func extractStatus(result json.RawMessage) (string, bool) {
 	if m, ok := resultObject(result); ok {
+		if agent, ok := nestedObject(m, "agent"); ok {
+			if s, ok := fieldString(agent, "agent_status"); ok {
+				return s, true
+			}
+		}
 		return fieldString(m, "status", "result")
 	}
 	var s string
