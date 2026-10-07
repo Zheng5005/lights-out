@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/Zheng5005/lights-out/internal/config"
 	"github.com/stretchr/testify/assert"
@@ -61,6 +62,8 @@ func TestResolveDefaultsFillsEveryMissingField(t *testing.T) {
 	assert.Equal(t, "herdr", resolved.Agent.Dispatcher)
 	assert.Equal(t, "headless", resolved.Agent.Mode)
 	assert.Equal(t, "agy", resolved.Agent.Kind)
+	assert.Equal(t, 15*time.Minute, resolved.Agent.Timeout)
+	assert.Equal(t, "default", resolved.Agent.Session)
 	assert.Equal(t, "main", resolved.Worktree.Base)
 }
 
@@ -75,7 +78,13 @@ func TestResolveDefaultsDoesNotOverrideExplicitValues(t *testing.T) {
 			InProgress: "p",
 			Blocked:    "b",
 		},
-		Agent:    config.Agent{Dispatcher: "d", Mode: "m", Kind: "k"},
+		Agent: config.Agent{
+			Dispatcher: "d",
+			Mode:       "m",
+			Kind:       "k",
+			Timeout:    42 * time.Minute,
+			Session:    "factory",
+		},
 		Worktree: config.Worktree{Base: "develop"},
 	}
 
@@ -98,6 +107,8 @@ func TestLoadAppliesDefaultsForAMinimalConfig(t *testing.T) {
 	assert.Equal(t, "herdr", cfg.Agent.Dispatcher)
 	assert.Equal(t, "headless", cfg.Agent.Mode)
 	assert.Equal(t, "agy", cfg.Agent.Kind)
+	assert.Equal(t, 15*time.Minute, cfg.Agent.Timeout)
+	assert.Equal(t, "default", cfg.Agent.Session)
 	assert.Equal(t, "main", cfg.Worktree.Base)
 }
 
@@ -251,6 +262,21 @@ func TestValidateRejects(t *testing.T) {
 			wantErr: "agent.kind must not be empty",
 		},
 		{
+			name:    "zero agent timeout",
+			break_:  func(c *config.Config) { c.Agent.Timeout = 0 },
+			wantErr: "agent.timeout must be greater than 0, got 0s",
+		},
+		{
+			name:    "negative agent timeout",
+			break_:  func(c *config.Config) { c.Agent.Timeout = -5 * time.Minute },
+			wantErr: "agent.timeout must be greater than 0, got -5m",
+		},
+		{
+			name:    "blank agent session",
+			break_:  func(c *config.Config) { c.Agent.Session = " " },
+			wantErr: "agent.session must not be empty",
+		},
+		{
 			name:    "blank worktree base",
 			break_:  func(c *config.Config) { c.Worktree.Base = " " },
 			wantErr: "worktree.base must not be empty",
@@ -286,6 +312,10 @@ func TestParseRejectsUnknownFields(t *testing.T) {
 		{
 			name: "misspelled worktree key",
 			yaml: "repo: owner/repo\nworktree:\n  based: main\n",
+		},
+		{
+			name: "misspelled agent timeout key",
+			yaml: "repo: owner/repo\nagent:\n  timout: 15m\n",
 		},
 	}
 
@@ -398,6 +428,102 @@ func TestLoadRejectsNonPositiveLimits(t *testing.T) {
 			require.Error(t, err)
 			assert.ErrorContains(t, err, tt.wantErr)
 			assert.Empty(t, cfg)
+		})
+	}
+}
+
+// TestLoadParsesAgentTimeout covers the Phase 4 Open Decision #5: the
+// agent.timeout key is a Go duration string that decodes into
+// time.Duration.
+func TestLoadParsesAgentTimeout(t *testing.T) {
+	t.Setenv(config.EnvVar, writeConfig(t, "repo: owner/repo\nagent:\n  timeout: 15m\n"))
+
+	cfg, err := config.Load()
+
+	require.NoError(t, err)
+	assert.Equal(t, 15*time.Minute, cfg.Agent.Timeout)
+}
+
+// TestLoadRejectsInvalidAgentTimeout guards the absent/explicit boundary for
+// agent.timeout: an absent key falls back to the default, but an explicitly
+// configured unusable value is an authoring error and must name the key
+// instead of being silently promoted to a default that hides it.
+func TestLoadRejectsInvalidAgentTimeout(t *testing.T) {
+	cases := []struct {
+		name    string
+		yaml    string
+		wantErr string
+	}{
+		{
+			name:    "explicit zero timeout",
+			yaml:    "repo: owner/repo\nagent:\n  timeout: 0s\n",
+			wantErr: "agent.timeout must be greater than 0, got 0s",
+		},
+		{
+			name:    "explicit negative timeout",
+			yaml:    "repo: owner/repo\nagent:\n  timeout: -5m\n",
+			wantErr: "agent.timeout must be greater than 0, got -5m",
+		},
+		{
+			name:    "unparsable timeout",
+			yaml:    "repo: owner/repo\nagent:\n  timeout: banana\n",
+			wantErr: "agent.timeout: invalid duration \"banana\"",
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(config.EnvVar, writeConfig(t, tt.yaml))
+
+			cfg, err := config.Load()
+
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tt.wantErr)
+			assert.Empty(t, cfg)
+		})
+	}
+}
+
+// TestLoadKeepsConfiguredAgentSession documents the string philosophy: an
+// explicitly configured session is kept as written, and an explicit empty
+// string is indistinguishable from an absent key, so it falls back to the
+// default instead of being an error.
+func TestLoadKeepsConfiguredAgentSession(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{
+			name: "explicit session is kept",
+			yaml: "repo: owner/repo\nagent:\n  session: factory\n",
+			want: "factory",
+		},
+		{
+			name: "explicit default session is kept",
+			yaml: "repo: owner/repo\nagent:\n  session: default\n",
+			want: "default",
+		},
+		{
+			name: "explicit empty session gets the default",
+			yaml: "repo: owner/repo\nagent:\n  session: \"\"\n",
+			want: "default",
+		},
+		{
+			name: "omitted session gets the default",
+			yaml: "repo: owner/repo\n",
+			want: "default",
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(config.EnvVar, writeConfig(t, tt.yaml))
+
+			cfg, err := config.Load()
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, cfg.Agent.Session)
 		})
 	}
 }
