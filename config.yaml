@@ -49,6 +49,11 @@ agent:
   mode: headless
   # Herdr agent kind: agy, claude, gemini, ... Default when omitted: agy.
   kind: agy
+  # Agent prompt/wait timeout. Go duration string; default when omitted: 15m;
+  # must be > 0.
+  timeout: 15m
+  # Herdr session the dispatcher targets. Default when omitted: default.
+  session: default
 
 # Git worktree settings used by the Phase 4 agent runner.
 worktree:

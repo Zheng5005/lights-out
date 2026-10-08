@@ -20,6 +20,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -48,6 +49,10 @@ const (
 	// DefaultAgentKind matches the dispatcher default; callers can switch to
 	// "claude", "gemini", or any other Herdr agent kind.
 	DefaultAgentKind = "agy"
+	// DefaultAgentTimeout is the agent prompt/wait timeout. Default when omitted: 15m.
+	DefaultAgentTimeout = 15 * time.Minute
+	// DefaultAgentSession is the Herdr session the dispatcher targets. Default when omitted: default.
+	DefaultAgentSession = "default"
 	// DefaultWorktreeBase is the base ref worktrees are created from.
 	DefaultWorktreeBase = "main"
 )
@@ -72,9 +77,11 @@ type Labels struct {
 
 // Agent describes how Herdr is invoked to run work.
 type Agent struct {
-	Dispatcher string `yaml:"dispatcher"` // "herdr"
-	Mode       string `yaml:"mode"`       // "headless"
-	Kind       string `yaml:"kind"`       // e.g. "agy", "claude", "gemini"
+	Dispatcher string        `yaml:"dispatcher"` // "herdr"
+	Mode       string        `yaml:"mode"`       // "headless"
+	Kind       string        `yaml:"kind"`       // e.g. "agy", "claude", "gemini"
+	Timeout    time.Duration // decoded from mirror; absent => default 15m
+	Session    string        `yaml:"session"` // Herdr session the dispatcher targets
 }
 
 // Worktree configures the Phase 4 worktree base ref (plan Open Decision #4).
@@ -96,13 +103,26 @@ func ResolvePath() string {
 // key: absent means "apply the default", explicit non-positive means the config
 // is wrong and must be reported instead of silently replaced by a default.
 type configFile struct {
-	Enabled          bool     `yaml:"enabled"`
-	Repo             string   `yaml:"repo"`
-	ConcurrencyLimit *int     `yaml:"concurrency_limit"`
-	DailyLimit       *int     `yaml:"daily_limit"`
-	Labels           Labels   `yaml:"labels"`
-	Agent            Agent    `yaml:"agent"`
-	Worktree         Worktree `yaml:"worktree"`
+	Enabled          bool      `yaml:"enabled"`
+	Repo             string    `yaml:"repo"`
+	ConcurrencyLimit *int      `yaml:"concurrency_limit"`
+	DailyLimit       *int      `yaml:"daily_limit"`
+	Labels           Labels    `yaml:"labels"`
+	Agent            agentFile `yaml:"agent"`
+	Worktree         Worktree  `yaml:"worktree"`
+}
+
+// agentFile is the on-disk shape of the agent block. Timeout stays a string
+// here for the same reason the limits are pointers above: an absent key must
+// be distinguishable from an explicit unparsable value, so the strict-loader
+// philosophy is preserved — an explicit "0s", negative, or garbage duration
+// fails loudly instead of silently falling back to the default.
+type agentFile struct {
+	Dispatcher string `yaml:"dispatcher"`
+	Mode       string `yaml:"mode"`
+	Kind       string `yaml:"kind"`
+	Timeout    string `yaml:"timeout"`
+	Session    string `yaml:"session"`
 }
 
 // Parse decodes a YAML document into a Config. Unknown fields are rejected so
@@ -127,8 +147,16 @@ func Parse(r io.Reader) (Config, error) {
 		Enabled:  file.Enabled,
 		Repo:     file.Repo,
 		Labels:   file.Labels,
-		Agent:    file.Agent,
 		Worktree: file.Worktree,
+		Agent: Agent{
+			Dispatcher: file.Agent.Dispatcher,
+			Mode:       file.Agent.Mode,
+			Kind:       file.Agent.Kind,
+			Session:    file.Agent.Session,
+		},
+	}
+	if err := assignTimeout("agent.timeout", file.Agent.Timeout, &cfg.Agent.Timeout); err != nil {
+		return Config{}, err
 	}
 	if err := assignLimit("concurrency_limit", file.ConcurrencyLimit, &cfg.ConcurrencyLimit); err != nil {
 		return Config{}, err
@@ -149,6 +177,25 @@ func assignLimit(key string, value *int, dst *int) error {
 		return fmt.Errorf("%s must be greater than 0, got %d", key, *value)
 	}
 	*dst = *value
+	return nil
+}
+
+// assignTimeout parses an explicitly configured Go duration string into dst.
+// An empty value means the key was absent (or explicitly empty), so dst stays
+// zero and ResolveDefaults fills it later. An unparsable or non-positive
+// value is an authoring error that names the key.
+func assignTimeout(key string, value string, dst *time.Duration) error {
+	if value == "" {
+		return nil
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return fmt.Errorf("%s: invalid duration %q", key, value)
+	}
+	if parsed <= 0 {
+		return fmt.Errorf("%s must be greater than 0, got %v", key, parsed)
+	}
+	*dst = parsed
 	return nil
 }
 
@@ -205,6 +252,12 @@ func ResolveDefaults(c Config) Config {
 	if c.Agent.Kind == "" {
 		c.Agent.Kind = DefaultAgentKind
 	}
+	if c.Agent.Timeout == 0 {
+		c.Agent.Timeout = DefaultAgentTimeout
+	}
+	if c.Agent.Session == "" {
+		c.Agent.Session = DefaultAgentSession
+	}
 	if c.Worktree.Base == "" {
 		c.Worktree.Base = DefaultWorktreeBase
 	}
@@ -216,9 +269,10 @@ func ResolveDefaults(c Config) Config {
 //
 //   - repo must be exactly "owner/repo" (one slash, both parts non-empty),
 //   - concurrency_limit and daily_limit must be greater than zero,
+//   - agent.timeout must be greater than zero,
 //   - labels.trigger, labels.in_progress, labels.blocked must be non-blank,
-//   - agent.dispatcher, agent.mode, agent.kind and worktree.base must be
-//     non-blank.
+//   - agent.dispatcher, agent.mode, agent.kind, agent.session and worktree.base
+//     must be non-blank.
 func Validate(c Config) error {
 	if err := validateRepo(c.Repo); err != nil {
 		return err
@@ -245,6 +299,15 @@ func Validate(c Config) error {
 		return err
 	}
 	if err := validateNonBlank("agent.kind", c.Agent.Kind); err != nil {
+		return err
+	}
+	if c.Agent.Timeout <= 0 {
+		// Defensive: Parse already rejects an explicit non-positive or
+		// unparsable timeout, and ResolveDefaults fills an absent one, so a
+		// zero reaching here means a caller built the Config by hand.
+		return fmt.Errorf("agent.timeout must be greater than 0, got %v", c.Agent.Timeout)
+	}
+	if err := validateNonBlank("agent.session", c.Agent.Session); err != nil {
 		return err
 	}
 	return validateNonBlank("worktree.base", c.Worktree.Base)
