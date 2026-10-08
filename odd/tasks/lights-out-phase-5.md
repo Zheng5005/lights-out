@@ -72,29 +72,36 @@ Verified independently by the parent: `gofmt` clean, build OK, vet OK, 238 tests
 6 packages. `pipeline.go` read in full — a straight-line translation of PRD §4 steps
 2–4 with no invented logging or premature abstraction.
 
-### T4 — execute via Herdr
-- [ ] `Probe` first, fail fast (plan Phase 4 IMPORTANT).
+### T4 + T5 + T6 — execute, land, and clean up (ONE work unit)
+> Inseparable. The defer cleanup and the FR6 single-comment rule are cross-cutting
+> concerns that must wrap the entire post-lock section from the first line. Splitting
+> them would ship an intermediate commit that leaks worktrees and strands issues in
+> `in_progress`.
+
+- [ ] `herdr.Probe` first, fail fast (plan Phase 4 IMPORTANT).
 - [ ] `CreateWorktree(cfg.Worktree.Path, "factory/issue-<N>", cfg.Worktree.Base)`.
-- [ ] Split pane → `StartAgent(cfg.Agent.Kind)` → `PromptAgent` → `WaitAgent`
-      with `cfg.Agent.Timeout`.
-- [ ] Success statuses: `idle` / `done`. Anything else → error path.
-- [ ] `ReadAgent` on failure for the diagnostic body.
-- [ ] Tests: fake herdr covering done, blocked, timeout, probe-down.
-
-### T5 — git push + success path
-- [ ] New `os/exec` git helper; push the worktree branch `factory/issue-<N>`.
+      Validate `Path`, `RootPaneID`, and `WorkspaceID` are non-empty — the Phase 4
+      live smoke pins all three as present.
+- [ ] `SplitPane(info.RootPaneID, "down", info.Path)` → `StartAgent` → `PromptAgent`.
+- [ ] **`PromptAgent` alone, not `WaitAgent`** — it already sends `--wait` and returns
+      the settled status. A second wait call would be redundant.
+- [ ] Success status is **`done` only**, not `idle`. `internal/herdr` documents that
+      headless never reports `idle` (it requires a focused UI a factory session has
+      not got). Treat anything other than `done` as failure.
+- [ ] Prompt text is the issue title + body (PRD §4 step 5). Agent name unique per run.
+- [ ] On failure: `ReadAgent` for the diagnostic body.
+- [ ] **git push** via `os/exec`, run in `info.Path`, branch `factory/issue-<N>`.
+      Follow `internal/herdr`'s injectable-`execFunc` pattern so it is testable.
 - [ ] `CreatePR` with `Closes #<N>` in the body (PRD §4 step 6).
-- [ ] `RemoveLabel(in_progress)`.
-- [ ] Push/PR failure → error path, never a partial success.
-- [ ] Tests: command construction, PR body contains the closing keyword.
-
-### T6 — error path, FR6, defer cleanup
-- [ ] Single-comment guarantee: one bool, one comment, never two (FR6).
-- [ ] Swap `in_progress` → `blocked` on terminal failure (PRD §4 step 7).
-- [ ] `defer` releases `in_progress` and removes the worktree on ALL paths,
-      including panic → recover → report (FR4).
-- [ ] Cleanup errors are logged, never mask the original error.
-- [ ] Tests: panic path, double-post prevention, cleanup on every exit.
+- [ ] **Defer cleanup, on ALL exit paths including panic (FR4):** remove the worktree
+      via `RemoveWorktree(info.WorkspaceID)`, and release `in_progress`.
+- [ ] **FR6:** exactly one failure comment per run. Track a posted flag; never two.
+- [ ] Error path: one comment + swap `in_progress` → `blocked` (PRD §4 step 7).
+- [ ] Cleanup errors never mask the original error; with no original error, a cleanup
+      error becomes the returned error.
+- [ ] Tests: fake herdr covering done / blocked / probe-down / empty-Path; git command
+      construction; PR body contains `Closes #`; panic path releases the lock; comment
+      posted exactly once; worktree removed on every exit.
 
 ### T7 — full live end-to-end loop (RESOLVED: full loop, both paths)
 
