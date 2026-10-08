@@ -49,21 +49,28 @@ Verified independently by the parent: `gofmt` clean, build OK, vet OK, 227 tests
 5 packages. `ResolveDefaults` confirmed to never touch `Path`; `validateWorktreePath`
 confirmed to perform no `os.Stat`.
 
-### T2 + T3 — gate, capacity, claim, lock (land as ONE work unit)
-> T2 alone would be a pipeline that checks capacity and exits without doing anything —
-> not a deliverable behaviour. Gate → capacity → claim → lock is the smallest unit that
-> is actually meaningful and testable end to end, so T2 and T3 commit together.
+### T2 + T3 — gate, capacity, claim, lock ✅ DONE — `7c4ba8c`
+> Merged into one work unit: gate→capacity→claim→lock is the smallest unit that is
+> actually meaningful. A gate-only pipeline would check capacity and exit without
+> doing anything.
 
-- [ ] `internal/pipeline.Run(ctx, cfg, gh, herdr, daily) error`.
-- [ ] Step 1 gate: `!cfg.Enabled` → silent return (FR1). Must make **zero** client calls.
-- [ ] Step 2a concurrency: `gh.CountIssuesByLabel(in_progress) >= cfg.ConcurrencyLimit`.
-- [ ] Step 2b daily: `daily.Current() >= cfg.DailyLimit` (FR3, UTC day).
-- [ ] Both capacity exits are silent, by design.
-- [ ] `ListClaimCandidates` → empty slice is a silent exit.
-- [ ] `AddLabel(in_progress)` **before** `daily.Increment()` (FR4 ordering).
-- [ ] AddLabel failure aborts with no work started and no comment (nothing to report).
-- [ ] Tests with fakes: disabled makes zero client calls; at-limit makes zero claims;
-      ordering asserted; AddLabel error stops the run.
+- [x] `internal/pipeline.Run(ctx, cfg, gh, hd, daily) error`.
+      Signature takes `herdr.HerdrClient` from day one so T4 widens the body, never
+      the signature — no caller breaks. `nil` is valid until execution lands.
+- [x] Gate: `!cfg.Enabled` → silent `nil` (FR1).
+- [x] Concurrency: `CountIssuesByLabel(in_progress) >= cfg.ConcurrencyLimit` → silent.
+- [x] Daily: `daily.Current() >= cfg.DailyLimit` → silent (FR3; UTC boundary stays
+      owned by `daily.Counter`, not reimplemented).
+- [x] `ListClaimCandidates` → empty is a silent exit; head of list is the oldest.
+- [x] `AddLabel` **before** `daily.Increment()` (FR4). AddLabel failure returns the
+      error with no Increment, no comment, no work.
+- [x] Tests: FR1 asserts all six `Client` methods individually plus a shared call
+      sequence, with `nil` herdr so any dispatch panics. FR4 uses **exact sequence
+      equality**, not presence — a reordering regression cannot pass silently.
+
+Verified independently by the parent: `gofmt` clean, build OK, vet OK, 238 tests in
+6 packages. `pipeline.go` read in full — a straight-line translation of PRD §4 steps
+2–4 with no invented logging or premature abstraction.
 
 ### T4 — execute via Herdr
 - [ ] `Probe` first, fail fast (plan Phase 4 IMPORTANT).
