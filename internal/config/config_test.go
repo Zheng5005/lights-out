@@ -43,7 +43,7 @@ func TestLoadMissingFileIsAnError(t *testing.T) {
 }
 
 func TestLoadReadsThePathFromTheEnvVar(t *testing.T) {
-	t.Setenv(config.EnvVar, writeConfig(t, "repo: envvar/repo\n"))
+	t.Setenv(config.EnvVar, writeConfig(t, "repo: envvar/repo\nworktree:\n  path: /srv/lights-out/target\n"))
 
 	cfg, err := config.Load()
 
@@ -65,6 +65,9 @@ func TestResolveDefaultsFillsEveryMissingField(t *testing.T) {
 	assert.Equal(t, 15*time.Minute, resolved.Agent.Timeout)
 	assert.Equal(t, "default", resolved.Agent.Session)
 	assert.Equal(t, "main", resolved.Worktree.Base)
+	// worktree.path deliberately has no default: it must stay empty so
+	// Validate reports the missing key instead of a placeholder.
+	assert.Empty(t, resolved.Worktree.Path)
 }
 
 func TestResolveDefaultsDoesNotOverrideExplicitValues(t *testing.T) {
@@ -94,7 +97,7 @@ func TestResolveDefaultsDoesNotOverrideExplicitValues(t *testing.T) {
 }
 
 func TestLoadAppliesDefaultsForAMinimalConfig(t *testing.T) {
-	t.Setenv(config.EnvVar, writeConfig(t, "repo: owner/repo\n"))
+	t.Setenv(config.EnvVar, writeConfig(t, "repo: owner/repo\nworktree:\n  path: /srv/lights-out/target\n"))
 
 	cfg, err := config.Load()
 
@@ -110,6 +113,7 @@ func TestLoadAppliesDefaultsForAMinimalConfig(t *testing.T) {
 	assert.Equal(t, 15*time.Minute, cfg.Agent.Timeout)
 	assert.Equal(t, "default", cfg.Agent.Session)
 	assert.Equal(t, "main", cfg.Worktree.Base)
+	assert.Equal(t, "/srv/lights-out/target", cfg.Worktree.Path)
 }
 
 func TestLoadKeepsConfiguredValues(t *testing.T) {
@@ -128,6 +132,7 @@ agent:
   kind: claude
 worktree:
   base: develop
+  path: /srv/lights-out/target
 `))
 
 	cfg, err := config.Load()
@@ -142,10 +147,11 @@ worktree:
 	assert.Equal(t, "stuck", cfg.Labels.Blocked)
 	assert.Equal(t, "claude", cfg.Agent.Kind)
 	assert.Equal(t, "develop", cfg.Worktree.Base)
+	assert.Equal(t, "/srv/lights-out/target", cfg.Worktree.Path)
 }
 
 func TestLoadAcceptsADisabledConfig(t *testing.T) {
-	t.Setenv(config.EnvVar, writeConfig(t, "enabled: false\nrepo: owner/repo\n"))
+	t.Setenv(config.EnvVar, writeConfig(t, "enabled: false\nrepo: owner/repo\nworktree:\n  path: /srv/lights-out/target\n"))
 
 	cfg, err := config.Load()
 
@@ -165,14 +171,24 @@ func TestLoadValidatesEvenWhenDisabled(t *testing.T) {
 }
 
 func TestValidateAcceptsAMinimalResolvedConfig(t *testing.T) {
-	assert.NoError(t, config.Validate(config.ResolveDefaults(config.Config{Repo: "owner/repo"})))
+	// worktree.path is required with no default, so even the minimal valid
+	// configuration carries it explicitly.
+	minimal := config.ResolveDefaults(config.Config{
+		Repo:     "owner/repo",
+		Worktree: config.Worktree{Path: "/srv/lights-out/target"},
+	})
+
+	assert.NoError(t, config.Validate(minimal))
 }
 
 // validBase returns a fully resolved, valid configuration. Each rejection case
 // starts from it and breaks exactly one field, so the reported error always
 // names the field under test instead of an earlier one.
 func validBase() config.Config {
-	return config.ResolveDefaults(config.Config{Repo: "owner/repo"})
+	return config.ResolveDefaults(config.Config{
+		Repo:     "owner/repo",
+		Worktree: config.Worktree{Path: "/srv/lights-out/target"},
+	})
 }
 
 func TestValidateRejects(t *testing.T) {
@@ -281,6 +297,16 @@ func TestValidateRejects(t *testing.T) {
 			break_:  func(c *config.Config) { c.Worktree.Base = " " },
 			wantErr: "worktree.base must not be empty",
 		},
+		{
+			name:    "blank worktree path",
+			break_:  func(c *config.Config) { c.Worktree.Path = " " },
+			wantErr: "worktree.path must not be empty",
+		},
+		{
+			name:    "relative worktree path",
+			break_:  func(c *config.Config) { c.Worktree.Path = "relative/dir" },
+			wantErr: "worktree.path must be an absolute path",
+		},
 	}
 
 	for _, tt := range cases {
@@ -369,7 +395,7 @@ func TestLoadFallsBackToTheDefaultPathInTheWorkingDirectory(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(
 		filepath.Join(dir, "config.yaml"),
-		[]byte("repo: fallback/repo\n"),
+		[]byte("repo: fallback/repo\nworktree:\n  path: /srv/lights-out/target\n"),
 		0o600,
 	))
 
@@ -436,7 +462,7 @@ func TestLoadRejectsNonPositiveLimits(t *testing.T) {
 // agent.timeout key is a Go duration string that decodes into
 // time.Duration.
 func TestLoadParsesAgentTimeout(t *testing.T) {
-	t.Setenv(config.EnvVar, writeConfig(t, "repo: owner/repo\nagent:\n  timeout: 15m\n"))
+	t.Setenv(config.EnvVar, writeConfig(t, "repo: owner/repo\nagent:\n  timeout: 15m\nworktree:\n  path: /srv/lights-out/target\n"))
 
 	cfg, err := config.Load()
 
@@ -496,22 +522,22 @@ func TestLoadKeepsConfiguredAgentSession(t *testing.T) {
 	}{
 		{
 			name: "explicit session is kept",
-			yaml: "repo: owner/repo\nagent:\n  session: factory\n",
+			yaml: "repo: owner/repo\nagent:\n  session: factory\nworktree:\n  path: /srv/lights-out/target\n",
 			want: "factory",
 		},
 		{
 			name: "explicit default session is kept",
-			yaml: "repo: owner/repo\nagent:\n  session: default\n",
+			yaml: "repo: owner/repo\nagent:\n  session: default\nworktree:\n  path: /srv/lights-out/target\n",
 			want: "default",
 		},
 		{
 			name: "explicit empty session gets the default",
-			yaml: "repo: owner/repo\nagent:\n  session: \"\"\n",
+			yaml: "repo: owner/repo\nagent:\n  session: \"\"\nworktree:\n  path: /srv/lights-out/target\n",
 			want: "default",
 		},
 		{
 			name: "omitted session gets the default",
-			yaml: "repo: owner/repo\n",
+			yaml: "repo: owner/repo\nworktree:\n  path: /srv/lights-out/target\n",
 			want: "default",
 		},
 	}
@@ -526,6 +552,125 @@ func TestLoadKeepsConfiguredAgentSession(t *testing.T) {
 			assert.Equal(t, tt.want, cfg.Agent.Session)
 		})
 	}
+}
+
+// TestLoadRequiresWorktreePath covers the Phase 5 contract: worktree.path is
+// required with no default, must not be blank, and must be an absolute path.
+// Absent and explicitly empty are the same invalid state — there is nothing to
+// default to — so both must fail loudly and name the key.
+func TestLoadRequiresWorktreePath(t *testing.T) {
+	cases := []struct {
+		name    string
+		yaml    string
+		wantErr string
+	}{
+		{
+			name:    "absent path",
+			yaml:    "repo: owner/repo\n",
+			wantErr: "worktree.path must not be empty",
+		},
+		{
+			name:    "explicit empty path",
+			yaml:    "repo: owner/repo\nworktree:\n  path: \"\"\n",
+			wantErr: "worktree.path must not be empty",
+		},
+		{
+			name:    "blank path",
+			yaml:    "repo: owner/repo\nworktree:\n  path: \" \"\n",
+			wantErr: "worktree.path must not be empty",
+		},
+		{
+			name:    "relative path",
+			yaml:    "repo: owner/repo\nworktree:\n  path: relative/dir\n",
+			wantErr: "worktree.path must be an absolute path",
+		},
+		{
+			// Only "~" and "~/" expand; any other tilde form stays as
+			// written and fails the absoluteness rule.
+			name:    "tilde form that is not expanded",
+			yaml:    "repo: owner/repo\nworktree:\n  path: \"~other/target\"\n",
+			wantErr: "worktree.path must be an absolute path",
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(config.EnvVar, writeConfig(t, tt.yaml))
+
+			cfg, err := config.Load()
+
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tt.wantErr)
+			assert.Empty(t, cfg)
+		})
+	}
+}
+
+// TestLoadKeepsAnAbsoluteWorktreePath documents both halves of the contract
+// for a valid value: it is preserved verbatim, and it is never stat-ed at load
+// time — the path below does not exist, yet the load succeeds. Config load
+// validates config correctness, never environment existence; the runtime probe
+// owns that check.
+func TestLoadKeepsAnAbsoluteWorktreePath(t *testing.T) {
+	t.Setenv(config.EnvVar, writeConfig(t, "repo: owner/repo\nworktree:\n  path: /srv/lights-out/target\n"))
+
+	cfg, err := config.Load()
+
+	require.NoError(t, err)
+	assert.Equal(t, "/srv/lights-out/target", cfg.Worktree.Path)
+	assert.True(t, filepath.IsAbs(cfg.Worktree.Path))
+}
+
+// TestLoadExpandsWorktreePathHome covers the ~ expansion performed during
+// Parse: a value that is exactly "~" or starts with "~/" resolves to the
+// user's home directory before validation. HOME points at a temp dir so the
+// test never depends on the real home directory.
+func TestLoadExpandsWorktreePathHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cases := []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{
+			name: "tilde slash subpath",
+			yaml: "repo: owner/repo\nworktree:\n  path: \"~/clones/target\"\n",
+			want: filepath.Join(home, "clones", "target"),
+		},
+		{
+			name: "bare tilde expands to the home directory",
+			yaml: "repo: owner/repo\nworktree:\n  path: \"~\"\n",
+			want: home,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(config.EnvVar, writeConfig(t, tt.yaml))
+
+			cfg, err := config.Load()
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, cfg.Worktree.Path)
+			assert.True(t, filepath.IsAbs(cfg.Worktree.Path))
+		})
+	}
+}
+
+// TestLoadRejectsWorktreePathWhenHomeCannotBeResolved: expansion is required
+// but the home directory cannot be resolved, so the authoring error must name
+// the key instead of silently keeping the unexpanded value.
+func TestLoadRejectsWorktreePathWhenHomeCannotBeResolved(t *testing.T) {
+	t.Setenv("HOME", "")
+	t.Setenv(config.EnvVar, writeConfig(t, "repo: owner/repo\nworktree:\n  path: \"~/clones/target\"\n"))
+
+	cfg, err := config.Load()
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "worktree.path")
+	assert.Empty(t, cfg)
 }
 
 // TestShippedConfigExampleIsValid keeps the documented example in sync with the

@@ -55,7 +55,15 @@ agent:
   # Herdr session the dispatcher targets. Default when omitted: default.
   session: default
 
-# Git worktree settings used by the Phase 4 agent runner.
+# Git worktree settings used by the Phase 4 agent runner and the Phase 5
+# pipeline.
 worktree:
   # Base ref new worktrees are created from. Default when omitted: main.
   base: main
+  # Local clone of the target repository named in repo — not a clone of
+  # lights-out itself — that issue worktrees are created from. Required, no
+  # default. Not checked for existence at load time: config load validates
+  # config correctness, never environment existence (the runtime probe owns
+  # that). A leading "~" or "~/" expands to the home directory; the value must
+  # be an absolute path after expansion.
+  path: "/home/zheng5005/Documents/Projects/Spotify-clone-frontend-focus-"
