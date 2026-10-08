@@ -34,31 +34,36 @@ failure routes to exactly one comment plus the blocked label.
 
 ## Tasks
 
-### T1 — config: `worktree.path` (required, no default)
-- [ ] Add `Path string \`yaml:"path"\`` to `Worktree`.
-- [ ] Mirror in `configFile`; it needs no pointer trick (absent == "" == validation
-      failure, so the strictness is preserved without one).
-- [ ] `Validate`: non-blank, `~`-expanded, absolute. Name the key in the error.
-- [ ] Do **not** check existence or git-ness at load. Phase 4 precedent: environment
-      correctness belongs to the runtime probe, not config load.
-- [ ] Document in `config.yaml` that this is the local clone of the **target** repo,
-      not `lights-out`.
-- [ ] Tests: default-absent rejected, relative rejected, `~/...` accepted and
-      expanded, existing `TestShippedConfigExampleIsValid` still green.
+### T1 — config: `worktree.path` (required, no default) ✅ DONE — `cbbe939`
+- [x] Add `Path string \`yaml:"path"\`` to `Worktree`.
+- [x] No pointer mirror in `configFile` — absent and explicit-empty are both invalid,
+      so there is no default case to distinguish. (Contrast the limits/timeout, where
+      the pointer separates absent from explicit-non-positive.)
+- [x] `Validate`: non-blank, `~`-expanded, absolute. Error names the key.
+- [x] No existence/git-ness check at load — Phase 4 precedent holds.
+- [x] Documented in `config.yaml` as the local clone of the **target** repo.
+- [x] Tests: absent/empty/blank/relative/non-expanded-tilde all rejected; absolute
+      accepted; `~/...` expanded; `TestShippedConfigExampleIsValid` green.
 
-### T2 — pipeline skeleton: gate + capacity
+Verified independently by the parent: `gofmt` clean, build OK, vet OK, 227 tests in
+5 packages. `ResolveDefaults` confirmed to never touch `Path`; `validateWorktreePath`
+confirmed to perform no `os.Stat`.
+
+### T2 + T3 — gate, capacity, claim, lock (land as ONE work unit)
+> T2 alone would be a pipeline that checks capacity and exits without doing anything —
+> not a deliverable behaviour. Gate → capacity → claim → lock is the smallest unit that
+> is actually meaningful and testable end to end, so T2 and T3 commit together.
+
 - [ ] `internal/pipeline.Run(ctx, cfg, gh, herdr, daily) error`.
-- [ ] Step 1 gate: `!cfg.Enabled` → silent return (FR1).
+- [ ] Step 1 gate: `!cfg.Enabled` → silent return (FR1). Must make **zero** client calls.
 - [ ] Step 2a concurrency: `gh.CountIssuesByLabel(in_progress) >= cfg.ConcurrencyLimit`.
 - [ ] Step 2b daily: `daily.Current() >= cfg.DailyLimit` (FR3, UTC day).
 - [ ] Both capacity exits are silent, by design.
-- [ ] Tests with fakes: disabled makes zero client calls; at-limit makes zero claims.
-
-### T3 — claim + lock
 - [ ] `ListClaimCandidates` → empty slice is a silent exit.
 - [ ] `AddLabel(in_progress)` **before** `daily.Increment()` (FR4 ordering).
-- [ ] AddLabel failure aborts with no work started, no comment (nothing to report).
-- [ ] Tests: ordering asserted; AddLabel error stops the run.
+- [ ] AddLabel failure aborts with no work started and no comment (nothing to report).
+- [ ] Tests with fakes: disabled makes zero client calls; at-limit makes zero claims;
+      ordering asserted; AddLabel error stops the run.
 
 ### T4 — execute via Herdr
 - [ ] `Probe` first, fail fast (plan Phase 4 IMPORTANT).
