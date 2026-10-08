@@ -120,42 +120,51 @@ Cloned at `3d9b123`, clean, default branch `main` — matches `worktree.base`.
 Both test issues already exist and carry `dark-factory`; all three labels already
 exist on the target repo, so no label setup is needed.
 
-- [ ] Run 1 — **success path**, issue **#2** "Testing Lights out":
+- [x] Run 1 — **success path**, issue **#2** "Testing Lights out":
       "make a simple 10 line change on the repo, it can comments."
-      Expect: worktree → agent → push → PR with `Closes #2` → `in_progress` released.
-- [ ] **Human merges PR for #2.** This is load-bearing, not bookkeeping: FR5 forbids the
-      factory from merging, and §6 never removes `dark-factory`, so #2 stays claimable
-      until a merge closes it. Without this merge, run 2 re-claims #2 and never reaches #4.
-- [ ] Run 2 — **error path**, issue **#4** "Light outs blocked":
+      ✅ **PASSED LIVE (2026-10-08):** PR **#5** opened, head `factory/issue-2`,
+      body end `Closes #2`, 1 commit, +11 `src/App.tsx`, mergeable; `in_progress`
+      released (labels back to `dark-factory`); no stray worktrees; counter 1.
+- [x] **Human merges PR #5 for #2** ✅ user merged → #2 closed (labels: `dark-factory`,
+      state closed). This was load-bearing and done by the human, keeping FR5 intact.
+- [x] Run 2 — **error path**, issue **#4** "Light outs blocked":
       "Don't do anything, just fail."
-      Expect: exactly one comment (FR6), `in_progress` → `blocked`, no PR, worktree and
-      lock released on the failure path.
-- [ ] Confirm after run 2: `in_progress` count back to 0, no stray worktrees in the
-      clone, daily counter = 2 (at limit).
+      ✅ **PASSED LIVE (2026-10-08):** agent settled `done` but left no changes →
+      T8 commit step refused the empty push; FR6 exactly ONE comment carrying the
+      reason; `factory-blocked` applied; `in_progress` released; no PR; no strays.
+- [x] Confirm after run 2: `in_progress` count back to 0 (both issues),
+      no stray worktrees in the clone (only `main` in `git worktree list`),
+      daily counter = 2 = limit (FR3 cap reached; a third run would silently no-op).
 
 ### T8 — headless agent run: trust dialogs, forced cleanup, and the missing commit
 > T7's first live attempt was blocked at `StartAgent` (`agent_not_ready`) by agy's
 > project-trust dialog; cleanup then hit a second live defect (`dirty_worktree_requires_force`),
 > and a code read exposed a third (no commit between agent work and push). One work unit.
 
-- [ ] Discovery (live, this session): `--dangerously-skip-permissions` ALONE does NOT
+- [x] Discovery (live, this session): `--dangerously-skip-permissions` ALONE does NOT
       suppress agy's trust dialog on a fresh worktree — herdr maps `trust_prompt` →
       `state=blocked` → `agent_not_ready`. Empirically: exact-path pre-trust in
       `settings.json` works but mutates the user's global config; `agy --add-dir <abs-path>`
       suppresses the trust dialog (reproduced 3×); `--add-dir .` does NOT (relative paths
       are not trusted). `--add-dir <abs-path>` + `--dangerously-skip-permissions` = ZERO
       dialogs end-to-end: start `idle`/ready, prompt settled `done`, agent wrote files.
-- [ ] Design: `agent.args []string` in config; exact token `{worktree}` replaced by the
+- [x] Design: `agent.args []string` in config; exact token `{worktree}` replaced by the
       run's absolute worktree path; `StartAgent` passes args after `--` (herdr 0.9.3:
       `agent start <name> --kind <kind> --pane <id> [-- [AGENT_ARG]...]`).
-- [ ] Live defect: `worktree remove` without `--force` fails with `dirty_worktree_requires_force`
+- [x] Live defect: `worktree remove` without `--force` fails with `dirty_worktree_requires_force`
       on an agent-dirtied worktree; Phase 4 doc (line 19) already pinned `--force`. Add it.
-- [ ] Code-read defect: pipeline has NO commit step (plan §197-240 step table cites only
+- [x] Code-read defect: pipeline has NO commit step (plan §197-240 step table cites only
       `git push`); a bare-agent run edits files without committing, so the pushed branch
       would carry nothing and `CreatePR` would 422. Add stage + commit before push; an
       agent that settles `done` with neither a commit nor a dirty tree is a failed run.
-- [ ] Route: delegated to `gentle-ai-worker` (config.go, client.go, pipeline.go + 3 test
-      files); parent verified independently and committed.
+- [x] Route: delegated to `gentle-ai-worker` (config.go, client.go, pipeline.go + 3 test
+      files); one new same-package test file `internal/pipeline/agentargs_test.go` was
+      added (deviation from the listed surfaces, accepted — the standard Go mechanism to
+      unit-test the unexported `agentArgs`). Parent verified independently (gofmt/build/
+      vet/test/race all green, 263 tests) and committed as `bdf2e51`. Committed config.yaml
+      template keeps `enabled: false`; the local live-fire `enabled: true` stays uncommitted.
+      **Both T8 behaviors proven live by T7's runs: Run 1's agent started headlessly with
+      zero dialogs; Run 2's failure came from the new commit step, not from any dialog.**
 
 ## Open decisions
 
@@ -177,14 +186,17 @@ exist on the target repo, so no label setup is needed.
 - ✅ T2+T3 (`7c4ba8c`) — gate/capacity/claim/lock
 - ✅ T4+T5+T6 (`aff1c90`) — execute/land/cleanup
 - ✅ T6.5 (`dba5284`) — CLI wiring (FR1 proven live)
-- ✅ T7 — RESOLVED: full loop both paths; Run 1 blocked at StartAgent by trust dialog
-  (see T8), cleanup hit `dirty_worktree_requires_force`; issues #2/#4 prepped, counter 1
-- 🔄 T8 — IN PROGRESS: dialog fix (config args + `{worktree}` token + StartAgent passthrough),
-  `--force` cleanup, commit-before-push
-- ⏳ T7 re-run — pending T8; reset daily counter, then Run 1 (#2, success) → human merge
-  → Run 2 (#4, fail)
+- ✅ T7 — RESOLVED: full loop, both paths, **verified live** — Run 1 success (#2 → PR #5,
+  human merged, #2 closed), Run 2 error (#4 → one comment, blocked, no PR, no strays,
+  counter = 2 = limit)
+- ✅ T8 (`bdf2e51`) — dialog fix (config `agent.args` + `{worktree}` token + StartAgent
+  passthrough), `--force` cleanup, commit-before-push; 263 tests green; both behaviors
+  proven live by T7's runs
 
 ## Next step
 
-Land T8 (verify + commit), update `config.yaml` agent.args, reset daily counter, re-run
-T7 Run 1 on issue #2.
+Phase 5 is functionally complete. Remaining: deliver to `main` as the single
+`size:exception` PR (human-chosen strategy, D2) — the user owns the timing of the push
+and PR. Optional tidy-up: delete the stale remote branch `factory/issue-2` (the repo does
+not auto-delete head branches on merge). Remember `config.yaml` `enabled: true` remains an
+uncommitted local arm.
