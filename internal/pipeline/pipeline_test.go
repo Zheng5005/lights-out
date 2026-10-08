@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -122,11 +123,13 @@ type paneCall struct {
 	newPaneID string
 }
 
-// startCall captures one StartAgent invocation.
+// startCall captures one StartAgent invocation, including the extra args the
+// pipeline forwarded after `--` (the {worktree}-expanded agent.args).
 type startCall struct {
-	name   string
-	kind   string
-	paneID string
+	name      string
+	kind      string
+	paneID    string
+	extraArgs []string
 }
 
 // promptCall captures one PromptAgent invocation.
@@ -238,10 +241,10 @@ func (h *fakeHerdr) SplitPane(ctx context.Context, paneID, direction, cwd string
 	return h.splitPaneID, h.splitErr
 }
 
-func (h *fakeHerdr) StartAgent(ctx context.Context, name, kind, paneID string) error {
+func (h *fakeHerdr) StartAgent(ctx context.Context, name, kind, paneID string, extraArgs ...string) error {
 	h.seq.record("hd.StartAgent")
 	h.ctxs = append(h.ctxs, ctx)
-	h.startCalls = append(h.startCalls, startCall{name: name, kind: kind, paneID: paneID})
+	h.startCalls = append(h.startCalls, startCall{name: name, kind: kind, paneID: paneID, extraArgs: extraArgs})
 	if h.panicOn == "StartAgent" {
 		panic("boom: StartAgent exploded")
 	}
@@ -292,14 +295,32 @@ type execCall struct {
 	ctx  context.Context
 }
 
-// fakeExec is the injected execFunc for RunWithRunner: it records the git
-// command the pipeline would have run instead of executing it, so no test
-// ever touches a real binary.
-type fakeExec struct {
-	seq    *callSeq
-	calls  []execCall
-	err    error
+// execResponse is the canned reply for one exec invocation.
+type execResponse struct {
 	output []byte
+	err    error
+}
+
+// fakeExec is the injected execFunc for RunWithRunner: it records every git
+// command the pipeline would have run and replies with the response scripted
+// for that exact command line, so no test ever touches a real binary. A
+// command with no scripted response fails loudly: an unscripted call means a
+// code path changed without its test, never a silent success.
+type fakeExec struct {
+	seq       *callSeq
+	responses map[string]execResponse
+	calls     []execCall
+}
+
+// respond scripts the reply for one command line (e.g. "git status
+// --porcelain") and returns the fake for chaining. output is returned as
+// combined output on success; err, when non-nil, makes the command fail.
+func (e *fakeExec) respond(command, output string, err error) *fakeExec {
+	if e.responses == nil {
+		e.responses = map[string]execResponse{}
+	}
+	e.responses[command] = execResponse{output: []byte(output), err: err}
+	return e
 }
 
 func (e *fakeExec) run(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
@@ -309,7 +330,22 @@ func (e *fakeExec) run(ctx context.Context, dir, name string, args ...string) ([
 	}
 	e.seq.record(event)
 	e.calls = append(e.calls, execCall{dir: dir, name: name, args: args, ctx: ctx})
-	return e.output, e.err
+	command := name + " " + strings.Join(args, " ")
+	resp, ok := e.responses[command]
+	if !ok {
+		return nil, fmt.Errorf("fakeExec: unexpected command %q", command)
+	}
+	return resp.output, resp.err
+}
+
+// newDirtyExec scripts the realistic live path for issueNum: the agent left
+// the worktree dirty, so the pipeline stages, commits, and pushes.
+func newDirtyExec(seq *callSeq, issueNum int) *fakeExec {
+	return (&fakeExec{seq: seq}).
+		respond("git status --porcelain", " M internal/foo.go\n", nil).
+		respond("git add -A", "", nil).
+		respond(fmt.Sprintf("git commit -m chore: apply changes for issue #%d", issueNum), "", nil).
+		respond(fmt.Sprintf("git push origin factory/issue-%d", issueNum), "", nil)
 }
 
 // testConfig returns a valid factory configuration with both limits at 2 and
@@ -490,7 +526,7 @@ func TestRunHappyPathRunsFullCycleLockingBeforeCharging(t *testing.T) {
 	counter, path := newTestCounter(t, seq)
 	cfg := testConfig()
 	hd := newFakeHerdr(seq)
-	exec := &fakeExec{seq: seq}
+	exec := newDirtyExec(seq, 7)
 	ctx := context.Background()
 
 	err := pipeline.RunWithRunner(ctx, cfg, gh, hd, counter, exec.run)
@@ -506,8 +542,11 @@ func TestRunHappyPathRunsFullCycleLockingBeforeCharging(t *testing.T) {
 		"hd.CreateWorktree",
 		"hd.SplitPane",
 		"hd.StartAgent",
-		"hd.PromptAgent",    // alone: it already waits (--wait)
-		"git.push",          // step 5b — in the worktree, before any PR
+		"hd.PromptAgent", // alone: it already waits (--wait)
+		"git.status",     // stage and commit the agent's work...
+		"git.add",
+		"git.commit",
+		"git.push",          // ...then step 5b — in the worktree, before any PR
 		"gh.CreatePR",       // step 6
 		"gh.RemoveLabel",    // step 6 — release the lock after the PR opened
 		"hd.RemoveWorktree", // FR4 defer — every exit path
@@ -547,12 +586,25 @@ func TestRunHappyPathRunsFullCycleLockingBeforeCharging(t *testing.T) {
 	assert.Empty(t, hd.waitCalls, "PromptAgent already waits; WaitAgent would be redundant")
 	assert.Empty(t, hd.readCalls, "a settled-done run needs no diagnostic read")
 
-	// Step 5b — the push: real git semantics, in the worktree, one branch.
-	require.Len(t, exec.calls, 1)
+	// Step 5b — the commit of the agent's dirty work, then the push: real git
+	// semantics, in the worktree, one branch.
+	require.Len(t, exec.calls, 4)
+	assert.Equal(t,
+		execCall{ctx: ctx, dir: "/repos/ship/worktrees/issue-7", name: "git", args: []string{"status", "--porcelain"}},
+		exec.calls[0],
+		"the agent's worktree must be inspected for changes first")
+	assert.Equal(t,
+		execCall{ctx: ctx, dir: "/repos/ship/worktrees/issue-7", name: "git", args: []string{"add", "-A"}},
+		exec.calls[1],
+		"a dirty worktree must be staged before committing")
+	assert.Equal(t,
+		execCall{ctx: ctx, dir: "/repos/ship/worktrees/issue-7", name: "git", args: []string{"commit", "-m", "chore: apply changes for issue #7"}},
+		exec.calls[2],
+		"the agent's changes must be committed with a conventional, attribution-free message")
 	assert.Equal(t,
 		execCall{ctx: ctx, dir: "/repos/ship/worktrees/issue-7", name: "git", args: []string{"push", "origin", "factory/issue-7"}},
-		exec.calls[0],
-		"git push must run in the worktree and push the issue branch")
+		exec.calls[3],
+		"git push must run in the worktree after the commit and push the issue branch")
 
 	// Step 6 — the PR carries the closing keyword that closes the issue on
 	// merge (FR5: the factory itself never merges).
@@ -591,6 +643,94 @@ func TestRunHappyPathRunsFullCycleLockingBeforeCharging(t *testing.T) {
 	// Read through a non-recording clock, after the sequence assertion:
 	// exactly one claim was charged, i.e. Increment ran exactly once.
 	assert.Equal(t, 1, currentDaily(t, path))
+}
+
+// TestRunPassesAgentArgsWithWorktreeExpansion proves the trust-dialog fix: the
+// configured agent.args are forwarded to StartAgent with the {worktree} token
+// replaced by the run's absolute worktree path, so agy's --add-dir
+// pre-authorizes the fresh worktree and --dangerously-skip-permissions
+// auto-approves tool permissions for an unmanned run.
+func TestRunPassesAgentArgsWithWorktreeExpansion(t *testing.T) {
+	seq := &callSeq{}
+	gh := &fakeGitHub{seq: seq, candidates: []github.Issue{{Number: 7, Title: "Fix the thing"}}}
+	counter, _ := newTestCounter(t, seq)
+	cfg := testConfig()
+	cfg.Agent.Args = []string{"--add-dir", "{worktree}", "--dangerously-skip-permissions"}
+	hd := newFakeHerdr(seq)
+	exec := newDirtyExec(seq, 7)
+
+	err := pipeline.RunWithRunner(context.Background(), cfg, gh, hd, counter, exec.run)
+	require.NoError(t, err)
+
+	require.Len(t, hd.startCalls, 1)
+	assert.Equal(t,
+		[]string{"--add-dir", "/repos/ship/worktrees/issue-7", "--dangerously-skip-permissions"},
+		hd.startCalls[0].extraArgs,
+		"StartAgent must receive the configured args with {worktree} expanded to the run's absolute worktree path")
+}
+
+// TestRunCleanWorktreeWithAgentCommitPushes covers the other commit branch: the
+// agent already committed its own work, so the tree is clean and HEAD differs
+// from the base ref. The pipeline must skip add/commit and push directly.
+func TestRunCleanWorktreeWithAgentCommitPushes(t *testing.T) {
+	seq := &callSeq{}
+	gh := &fakeGitHub{seq: seq, candidates: []github.Issue{{Number: 7, Title: "Fix the thing"}}}
+	counter, _ := newTestCounter(t, seq)
+	cfg := testConfig()
+	hd := newFakeHerdr(seq)
+	exec := (&fakeExec{seq: seq}).
+		respond("git status --porcelain", "", nil).
+		respond("git rev-parse HEAD", "abc123\n", nil).
+		respond("git rev-parse main", "def456\n", nil).
+		respond("git push origin factory/issue-7", "", nil)
+
+	err := pipeline.RunWithRunner(context.Background(), cfg, gh, hd, counter, exec.run)
+	require.NoError(t, err)
+
+	// status, rev-parse HEAD, rev-parse base, push — with no add/commit.
+	require.Len(t, exec.calls, 4)
+	for _, call := range exec.calls {
+		assert.NotEqual(t, "add", call.args[0], "a clean tree must not be staged")
+		assert.NotEqual(t, "commit", call.args[0], "a clean tree must not be committed again")
+	}
+	last := exec.calls[len(exec.calls)-1]
+	assert.Equal(t, "factory/issue-7", last.args[len(last.args)-1], "the agent's own commit must still be pushed")
+	require.Len(t, gh.createPRCalls, 1, "a committed agent run opens the PR")
+	require.Empty(t, gh.commentCalls, "a successful run posts no comment (FR6)")
+}
+
+// TestRunCleanWorktreeAtBaseFailsWithoutPush covers the empty-run guard: the
+// agent settled `done`, but the tree is clean and HEAD equals the base ref, so
+// there is nothing to push. The run must fail loudly, never push an empty
+// branch and never open a PR.
+func TestRunCleanWorktreeAtBaseFailsWithoutPush(t *testing.T) {
+	seq := &callSeq{}
+	gh := &fakeGitHub{seq: seq, candidates: []github.Issue{{Number: 7, Title: "Fix the thing"}}}
+	counter, _ := newTestCounter(t, seq)
+	cfg := testConfig()
+	hd := newFakeHerdr(seq)
+	exec := (&fakeExec{seq: seq}).
+		respond("git status --porcelain", "", nil).
+		respond("git rev-parse HEAD", "abc123\n", nil).
+		respond("git rev-parse main", "abc123\n", nil)
+
+	err := pipeline.RunWithRunner(context.Background(), cfg, gh, hd, counter, exec.run)
+	require.ErrorContains(t, err, "commit agent work")
+	require.ErrorContains(t, err, "no changes", "the error must explain the empty worktree")
+
+	require.Len(t, exec.calls, 3, "status and both rev-parse calls only")
+	for _, call := range exec.calls {
+		assert.NotEqual(t, "push", call.args[0], "an empty branch must never be pushed")
+	}
+	assert.Empty(t, gh.createPRCalls, "an empty run must never open a PR")
+
+	require.Len(t, gh.commentCalls, 1, "FR6: exactly one comment on the failure path")
+	assert.Contains(t, gh.commentCalls[0].body, "no changes")
+	require.Len(t, gh.addLabelCalls, 2, "lock then blocked")
+	assert.Equal(t, labelCall{issueNum: 7, label: cfg.Labels.Blocked}, gh.addLabelCalls[1])
+	assert.Contains(t, gh.removeCalls, labelCall{issueNum: 7, label: cfg.Labels.InProgress},
+		"FR4: the lock must be released")
+	assert.Equal(t, []string{"ws-issue-7"}, hd.removeCalls, "the worktree must be removed on the failure path")
 }
 
 // TestRunProbeDownRoutesToErrorPathWithoutWorktree is the plan Phase 4
@@ -759,14 +899,16 @@ func TestRunGitPushFailureRoutesToErrorPath(t *testing.T) {
 	counter, _ := newTestCounter(t, seq)
 	cfg := testConfig()
 	hd := newFakeHerdr(seq)
-	exec := &fakeExec{seq: seq, err: errors.New("exit status 1"), output: []byte("remote: rejected")}
+	exec := newDirtyExec(seq, 7).
+		respond("git push origin factory/issue-7", "remote: rejected", errors.New("exit status 1"))
 
 	err := pipeline.RunWithRunner(context.Background(), cfg, gh, hd, counter, exec.run)
 	require.ErrorContains(t, err, "git push factory/issue-7")
 	require.ErrorContains(t, err, "remote: rejected", "git's output must reach the returned error")
 
-	require.Len(t, exec.calls, 1, "the push is attempted once")
-	assert.Equal(t, "factory/issue-7", exec.calls[0].args[len(exec.calls[0].args)-1])
+	require.Len(t, exec.calls, 4, "status, add, commit, then the single push")
+	last := exec.calls[len(exec.calls)-1]
+	assert.Equal(t, "factory/issue-7", last.args[len(last.args)-1])
 	assert.Empty(t, gh.createPRCalls, "a failed push must never reach CreatePR")
 
 	require.Len(t, gh.commentCalls, 1, "FR6: exactly one comment")
@@ -792,12 +934,12 @@ func TestRunCreatePRFailureRoutesToErrorPath(t *testing.T) {
 	counter, _ := newTestCounter(t, seq)
 	cfg := testConfig()
 	hd := newFakeHerdr(seq)
-	exec := &fakeExec{seq: seq}
+	exec := newDirtyExec(seq, 7)
 
 	err := pipeline.RunWithRunner(context.Background(), cfg, gh, hd, counter, exec.run)
 	require.ErrorIs(t, err, boom, "the CreatePR error must be returned unchanged")
 
-	require.Len(t, exec.calls, 1, "the push happens before the PR attempt")
+	require.Len(t, exec.calls, 4, "status, add, commit, and the push happen before the PR attempt")
 	require.Len(t, gh.createPRCalls, 1)
 	require.Len(t, gh.commentCalls, 1, "FR6: exactly one comment")
 	assert.Contains(t, gh.commentCalls[0].body, "create pull request")
@@ -878,7 +1020,7 @@ func TestRunWorktreeRemovalFailureAfterSuccessReturnsError(t *testing.T) {
 	cfg := testConfig()
 	hd := newFakeHerdr(seq)
 	hd.removeErr = errors.New("worktree remove failed: exit status 1")
-	exec := &fakeExec{seq: seq}
+	exec := newDirtyExec(seq, 7)
 
 	err := pipeline.RunWithRunner(context.Background(), cfg, gh, hd, counter, exec.run)
 	require.ErrorContains(t, err, "cleanup: remove worktree",

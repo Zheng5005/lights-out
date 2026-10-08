@@ -83,6 +83,14 @@ type Agent struct {
 	Kind       string        `yaml:"kind"`       // e.g. "agy", "claude", "gemini"
 	Timeout    time.Duration // decoded from mirror; absent => default 15m
 	Session    string        `yaml:"session"` // Herdr session the dispatcher targets
+	// Args are extra arguments passed to the agent binary after `--` on
+	// `herdr agent start`. The exact token `{worktree}` is replaced by the
+	// run's absolute worktree path (the replacement happens in the pipeline
+	// at StartAgent time, not in config). Empty or absent means no extra
+	// args. For agy, `--add-dir {worktree}` suppresses the project-trust
+	// dialog and `--dangerously-skip-permissions` auto-approves tool
+	// permissions; both are required for an unmanned run.
+	Args []string `yaml:"args"`
 }
 
 // Worktree configures where issue worktrees are created: the Phase 4 base ref
@@ -130,11 +138,12 @@ type configFile struct {
 // philosophy is preserved — an explicit "0s", negative, or garbage duration
 // fails loudly instead of silently falling back to the default.
 type agentFile struct {
-	Dispatcher string `yaml:"dispatcher"`
-	Mode       string `yaml:"mode"`
-	Kind       string `yaml:"kind"`
-	Timeout    string `yaml:"timeout"`
-	Session    string `yaml:"session"`
+	Dispatcher string   `yaml:"dispatcher"`
+	Mode       string   `yaml:"mode"`
+	Kind       string   `yaml:"kind"`
+	Timeout    string   `yaml:"timeout"`
+	Session    string   `yaml:"session"`
+	Args       []string `yaml:"args"` // verbatim; {worktree} expands in the pipeline
 }
 
 // Parse decodes a YAML document into a Config. Unknown fields are rejected so
@@ -165,6 +174,7 @@ func Parse(r io.Reader) (Config, error) {
 			Mode:       file.Agent.Mode,
 			Kind:       file.Agent.Kind,
 			Session:    file.Agent.Session,
+			Args:       file.Agent.Args,
 		},
 	}
 	if err := assignTimeout("agent.timeout", file.Agent.Timeout, &cfg.Agent.Timeout); err != nil {

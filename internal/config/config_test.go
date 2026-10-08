@@ -673,6 +673,40 @@ func TestLoadRejectsWorktreePathWhenHomeCannotBeResolved(t *testing.T) {
 	assert.Empty(t, cfg)
 }
 
+// TestLoadParsesAgentArgs documents the agent.args contract: the list is read
+// verbatim from YAML — including the literal {worktree} token, which the
+// pipeline later expands to the run's absolute worktree path at StartAgent
+// time. An absent key yields no args.
+func TestLoadParsesAgentArgs(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		want []string
+	}{
+		{
+			name: "args with a worktree token round-trip verbatim",
+			yaml: "repo: owner/repo\nagent:\n  args:\n    - --add-dir\n    - \"{worktree}\"\n    - --dangerously-skip-permissions\nworktree:\n  path: /srv/lights-out/target\n",
+			want: []string{"--add-dir", "{worktree}", "--dangerously-skip-permissions"},
+		},
+		{
+			name: "absent args stay nil",
+			yaml: "repo: owner/repo\nworktree:\n  path: /srv/lights-out/target\n",
+			want: nil,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(config.EnvVar, writeConfig(t, tt.yaml))
+
+			cfg, err := config.Load()
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, cfg.Agent.Args)
+		})
+	}
+}
+
 // TestShippedConfigExampleIsValid keeps the documented example in sync with the
 // loader: the repository config.yaml must parse and validate as written.
 func TestShippedConfigExampleIsValid(t *testing.T) {

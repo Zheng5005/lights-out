@@ -133,6 +133,30 @@ exist on the target repo, so no label setup is needed.
 - [ ] Confirm after run 2: `in_progress` count back to 0, no stray worktrees in the
       clone, daily counter = 2 (at limit).
 
+### T8 — headless agent run: trust dialogs, forced cleanup, and the missing commit
+> T7's first live attempt was blocked at `StartAgent` (`agent_not_ready`) by agy's
+> project-trust dialog; cleanup then hit a second live defect (`dirty_worktree_requires_force`),
+> and a code read exposed a third (no commit between agent work and push). One work unit.
+
+- [ ] Discovery (live, this session): `--dangerously-skip-permissions` ALONE does NOT
+      suppress agy's trust dialog on a fresh worktree — herdr maps `trust_prompt` →
+      `state=blocked` → `agent_not_ready`. Empirically: exact-path pre-trust in
+      `settings.json` works but mutates the user's global config; `agy --add-dir <abs-path>`
+      suppresses the trust dialog (reproduced 3×); `--add-dir .` does NOT (relative paths
+      are not trusted). `--add-dir <abs-path>` + `--dangerously-skip-permissions` = ZERO
+      dialogs end-to-end: start `idle`/ready, prompt settled `done`, agent wrote files.
+- [ ] Design: `agent.args []string` in config; exact token `{worktree}` replaced by the
+      run's absolute worktree path; `StartAgent` passes args after `--` (herdr 0.9.3:
+      `agent start <name> --kind <kind> --pane <id> [-- [AGENT_ARG]...]`).
+- [ ] Live defect: `worktree remove` without `--force` fails with `dirty_worktree_requires_force`
+      on an agent-dirtied worktree; Phase 4 doc (line 19) already pinned `--force`. Add it.
+- [ ] Code-read defect: pipeline has NO commit step (plan §197-240 step table cites only
+      `git push`); a bare-agent run edits files without committing, so the pushed branch
+      would carry nothing and `CreatePR` would 422. Add stage + commit before push; an
+      agent that settles `done` with neither a commit nor a dirty tree is a failed run.
+- [ ] Route: delegated to `gentle-ai-worker` (config.go, client.go, pipeline.go + 3 test
+      files); parent verified independently and committed.
+
 ## Open decisions
 
 - ~~**D1 — How far is Phase 5 proven?~~ **RESOLVED: full live loop, both paths.**
@@ -149,8 +173,18 @@ exist on the target repo, so no label setup is needed.
 
 ## Progress
 
-_Not started._
+- ✅ T1 (`cbbe939`) — worktree.path config field
+- ✅ T2+T3 (`7c4ba8c`) — gate/capacity/claim/lock
+- ✅ T4+T5+T6 (`aff1c90`) — execute/land/cleanup
+- ✅ T6.5 (`dba5284`) — CLI wiring (FR1 proven live)
+- ✅ T7 — RESOLVED: full loop both paths; Run 1 blocked at StartAgent by trust dialog
+  (see T8), cleanup hit `dirty_worktree_requires_force`; issues #2/#4 prepped, counter 1
+- 🔄 T8 — IN PROGRESS: dialog fix (config args + `{worktree}` token + StartAgent passthrough),
+  `--force` cleanup, commit-before-push
+- ⏳ T7 re-run — pending T8; reset daily counter, then Run 1 (#2, success) → human merge
+  → Run 2 (#4, fail)
 
 ## Next step
 
-Resolve D1, then cut the branch and implement T1.
+Land T8 (verify + commit), update `config.yaml` agent.args, reset daily counter, re-run
+T7 Run 1 on issue #2.

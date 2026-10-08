@@ -119,7 +119,7 @@ func TestEveryMethodSendsFullArgv(t *testing.T) {
 	want := [][]string{
 		{"--session", "testsession", "agent", "list"},
 		{"--session", "testsession", "worktree", "create", "--cwd", "/w/repo", "--branch", "feat/x", "--base", "main", "--trust-repository"},
-		{"--session", "testsession", "worktree", "remove", "--workspace", "w1"},
+		{"--session", "testsession", "worktree", "remove", "--workspace", "w1", "--force"},
 		{"--session", "testsession", "workspace", "close", "ws:1"},
 		{"--session", "testsession", "pane", "split", "pane:root", "--direction", "right", "--cwd", "/w/repo", "--no-focus"},
 		{"--session", "testsession", "agent", "start", "coder", "--kind", "agy", "--pane", "pane:2"},
@@ -237,7 +237,44 @@ func TestRemoveWorktreeSendsWorkspaceFlag(t *testing.T) {
 	err := c.RemoveWorktree(context.Background(), "w9")
 
 	require.NoError(t, err)
-	want := []string{"--session", "factory", "worktree", "remove", "--workspace", "w9"}
+	want := []string{"--session", "factory", "worktree", "remove", "--workspace", "w9", "--force"}
+	assert.Equal(t, want, runner.calls[0])
+	requireArgvShape(t, runner.calls)
+}
+
+// TestStartAgentForwardsExtraArgs pins the headless agent-start contract: when
+// agent.args are configured, the extra arguments are appended after an
+// explicit `--` separator so herdr forwards them to the agent binary. agy uses
+// `--add-dir <abs worktree>` to suppress the project-trust dialog and
+// `--dangerously-skip-permissions` to auto-approve tool permissions — both are
+// required for an unmanned run.
+func TestStartAgentForwardsExtraArgs(t *testing.T) {
+	runner := newFakeRunner(map[string]scriptedCall{})
+	c := herdr.NewWithRunner("factory", runner.run)
+
+	err := c.StartAgent(context.Background(), "coder", "agy", "pane:2",
+		"--add-dir", "/w/repo", "--dangerously-skip-permissions")
+
+	require.NoError(t, err)
+	want := []string{
+		"--session", "factory",
+		"agent", "start", "coder", "--kind", "agy", "--pane", "pane:2",
+		"--", "--add-dir", "/w/repo", "--dangerously-skip-permissions",
+	}
+	assert.Equal(t, want, runner.calls[0])
+	requireArgvShape(t, runner.calls)
+}
+
+// TestStartAgentWithoutExtraArgsOmitsSeparator guards the variadic boundary:
+// with no extra args the argv must be exactly the bare start command — no
+// trailing `--` separator is sent to herdr.
+func TestStartAgentWithoutExtraArgsOmitsSeparator(t *testing.T) {
+	runner := newFakeRunner(map[string]scriptedCall{})
+	c := herdr.NewWithRunner("factory", runner.run)
+
+	require.NoError(t, c.StartAgent(context.Background(), "coder", "agy", "pane:2"))
+
+	want := []string{"--session", "factory", "agent", "start", "coder", "--kind", "agy", "--pane", "pane:2"}
 	assert.Equal(t, want, runner.calls[0])
 	requireArgvShape(t, runner.calls)
 }

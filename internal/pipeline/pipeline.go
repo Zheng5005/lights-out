@@ -21,6 +21,12 @@ import (
 // which a factory session never provides. Every other token is a failure.
 const agentStatusDone = "done"
 
+// worktreeToken is the exact token in a configured agent.args element that is
+// replaced by the run's absolute worktree path before StartAgent. Only a whole
+// element matching the token is expanded; a token merely embedded in a larger
+// argument is left alone.
+const worktreeToken = "{worktree}"
+
 // execFunc runs one external command named name with args in the working
 // directory dir and returns its combined output, plus a non-nil error when
 // the process could not start or exited non-zero. It is the pipeline's
@@ -208,11 +214,18 @@ func execute(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.
 	// Split a pane down from the worktree's root pane, with the worktree
 	// checkout as its cwd, and start the agent in it. The agent name is
 	// derived from the issue number, so it is unique per run.
+	//
+	// The configured agent args are passed through agentArgs so the {worktree}
+	// token expands to this run's absolute checkout path. They pre-authorize
+	// the worktree for an unmanned run: agy `--add-dir <abs path>` suppresses
+	// the project-trust dialog (which otherwise blocks startup with
+	// agent_not_ready), and `--dangerously-skip-permissions` auto-approves
+	// tool-permission requests — both are required.
 	paneID, err := hd.SplitPane(ctx, info.RootPaneID, "down", info.Path)
 	if err != nil {
 		return fmt.Errorf("split pane: %w", err)
 	}
-	if err = hd.StartAgent(ctx, agent, cfg.Agent.Kind, paneID); err != nil {
+	if err = hd.StartAgent(ctx, agent, cfg.Agent.Kind, paneID, agentArgs(cfg.Agent.Args, info.Path)...); err != nil {
 		return fmt.Errorf("start agent %s: %w", agent, err)
 	}
 
@@ -227,6 +240,15 @@ func execute(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.
 	if status != agentStatusDone {
 		return withAgentOutput(ctx, hd, agent,
 			fmt.Errorf("agent %s settled %q, want %q", agent, status, agentStatusDone))
+	}
+
+	// The agent edits files but does not commit them, so stage and commit its
+	// work BEFORE the push: a bare agy run leaves the branch empty, and
+	// CreatePR would then fail with "No commits between...". A `done` settle
+	// with neither a dirty tree nor a commit ahead of the base is a failed run
+	// — never push an empty branch.
+	if err = commitAgentWork(ctx, runner, info.Path, cfg.Worktree.Base, issue.Number); err != nil {
+		return fmt.Errorf("commit agent work: %w", err)
 	}
 
 	// Step 5b — push the issue branch from the worktree checkout. A push
@@ -250,6 +272,82 @@ func execute(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.
 	}
 	if err = gh.RemoveLabel(ctx, issue.Number, cfg.Labels.InProgress); err != nil {
 		return fmt.Errorf("release lock: %w", err)
+	}
+	return nil
+}
+
+// agentArgs expands the configured agent binary arguments for one run: every
+// element exactly equal to "{worktree}" is replaced by the run's absolute
+// worktree path; every other element passes through unchanged. It returns nil
+// when nothing is configured, and never mutates the configured slice.
+func agentArgs(configured []string, path string) []string {
+	if len(configured) == 0 {
+		return nil
+	}
+	args := make([]string, len(configured))
+	for i, arg := range configured {
+		if arg == worktreeToken {
+			args[i] = path
+		} else {
+			args[i] = arg
+		}
+	}
+	return args
+}
+
+// commitAgentWork stages and commits whatever the agent left in the worktree
+// so the pushed branch actually carries its changes. agy edits files without
+// committing, so a `done` settle followed directly by a push would push an
+// empty branch — the realistic live case is therefore a dirty worktree.
+//
+// Two cases:
+//   - a dirty worktree (modified or untracked files) is staged with
+//     `git add -A` and committed with a conventional, attribution-free
+//     message;
+//   - a clean worktree means the agent committed its own work, so HEAD must
+//     differ from the base ref. When HEAD equals base the agent settled
+//     `done` without producing any changes, and the run fails instead of
+//     pushing an empty branch.
+//
+// Every command failure is wrapped with the command, the directory, and git's
+// trimmed output so the single failure comment (FR6) carries the reason.
+func commitAgentWork(ctx context.Context, runner execFunc, dir, base string, issueNum int) error {
+	fail := func(command string, out []byte, err error) error {
+		if msg := strings.TrimSpace(string(out)); msg != "" {
+			return fmt.Errorf("%s (in %s): %w: %s", command, dir, err, msg)
+		}
+		return fmt.Errorf("%s (in %s): %w", command, dir, err)
+	}
+
+	statusOut, err := runner(ctx, dir, "git", "status", "--porcelain")
+	if err != nil {
+		return fail("git status --porcelain", statusOut, err)
+	}
+
+	if strings.TrimSpace(string(statusOut)) == "" {
+		// Clean tree: the agent must have committed its own work.
+		head, err := runner(ctx, dir, "git", "rev-parse", "HEAD")
+		if err != nil {
+			return fail("git rev-parse HEAD", head, err)
+		}
+		baseOut, err := runner(ctx, dir, "git", "rev-parse", base)
+		if err != nil {
+			return fail("git rev-parse "+base, baseOut, err)
+		}
+		if strings.TrimSpace(string(head)) == strings.TrimSpace(string(baseOut)) {
+			return fmt.Errorf(
+				"agent settled done for issue #%d but the worktree has no changes (HEAD equals %s); refusing to push an empty branch",
+				issueNum, base)
+		}
+		return nil
+	}
+
+	if out, err := runner(ctx, dir, "git", "add", "-A"); err != nil {
+		return fail("git add -A", out, err)
+	}
+	message := fmt.Sprintf("chore: apply changes for issue #%d", issueNum)
+	if out, err := runner(ctx, dir, "git", "commit", "-m", message); err != nil {
+		return fail("git commit -m "+message, out, err)
 	}
 	return nil
 }
