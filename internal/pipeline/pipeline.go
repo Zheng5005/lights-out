@@ -1,11 +1,13 @@
 // Package pipeline runs one factory cycle: the gate, the capacity checks,
-// the claim, and the lock of doc/V1.md §4. Execution, push, and PR creation
-// belong to the later Phase 5 tasks; Run currently stops as soon as the
-// issue is locked.
+// the claim and lock, the agent execution in an isolated worktree, the pull
+// request, and the cleanup — doc/V1.md §4 steps 2 through 7 (FR1–FR6).
 package pipeline
 
 import (
 	"context"
+	"fmt"
+	"os/exec"
+	"strings"
 
 	"github.com/Zheng5005/lights-out/internal/config"
 	"github.com/Zheng5005/lights-out/internal/daily"
@@ -13,8 +15,23 @@ import (
 	"github.com/Zheng5005/lights-out/internal/herdr"
 )
 
-// Run executes one factory cycle up to and including the claim lock —
-// doc/V1.md §4 steps 2 through 4 (FR1–FR4).
+// agentStatusDone is the ONLY success token accepted from PromptAgent.
+// internal/herdr's package doc pins it: a headless agent reports "done",
+// never "idle" — idle requires the agent's tab to be seen by a focused UI,
+// which a factory session never provides. Every other token is a failure.
+const agentStatusDone = "done"
+
+// execFunc runs one external command named name with args in the working
+// directory dir and returns its combined output, plus a non-nil error when
+// the process could not start or exited non-zero. It is the pipeline's
+// injectable-exec seam — the same approach as internal/herdr's execFunc:
+// the production implementation (runGit) shells out with os/exec, tests pass
+// a recorder instead, and no test ever touches a real binary.
+type execFunc func(ctx context.Context, dir, name string, args ...string) (output []byte, err error)
+
+// Run executes one factory cycle — doc/V1.md §4 steps 2 through 7 (FR1–FR6) —
+// through the real git binary. Tests call RunWithRunner to inject the exec
+// seam instead.
 //
 // Silent nil exits are specified behaviour, not omissions: the disabled
 // gate, both capacity limits, and an empty candidate list return nil with
@@ -22,10 +39,26 @@ import (
 // and lock steps are returned unchanged; each client already wraps its own
 // context, and a failed lock ends the cycle before any work starts.
 //
-// hd is the Herdr dispatcher the later execution step will drive. This unit
-// accepts it but never calls it — nil is valid until execution lands — so
-// adding execution later widens Run's body, never its signature.
+// Everything after the lock belongs to execute: the agent run in an
+// isolated worktree, the git push, the PR, and — on every exit path
+// including panic — the worktree removal, the lock release, and at most
+// one failure comment (FR4, FR6).
 func Run(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.HerdrClient, daily *daily.Counter) error {
+	return run(ctx, cfg, gh, hd, daily, runGit)
+}
+
+// RunWithRunner is Run's test seam — the same approach as
+// herdr.NewWithRunner: runner replaces the executor that performs the git
+// push, so tests never touch a real binary. Production code calls Run.
+func RunWithRunner(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.HerdrClient, daily *daily.Counter, runner execFunc) error {
+	return run(ctx, cfg, gh, hd, daily, runner)
+}
+
+// run is the shared body of Run and RunWithRunner: a straight-line
+// translation of doc/V1.md §4. Steps 2–4 (gate, capacity, claim, lock) live
+// here; steps 5–7 (execute, success, error) live in execute, whose single
+// defer wraps the whole post-lock section.
+func run(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.HerdrClient, daily *daily.Counter, runner execFunc) error {
 	// FR1 — gate. Checked before anything else; false means no action at all.
 	if !cfg.Enabled {
 		return nil
@@ -72,5 +105,213 @@ func Run(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.Herd
 	if _, err := daily.Increment(); err != nil {
 		return err
 	}
+
+	// The lock holds: §4 steps 5–7 — execute, land, clean up.
+	return execute(ctx, cfg, gh, hd, issue, runner)
+}
+
+// execute owns doc/V1.md §4 steps 5 through 7 — probe, worktree, agent,
+// push, PR, and the error path — plus ALL cleanup for that section.
+//
+// The deferred function is registered before the first fallible step and
+// therefore runs on every exit: normal return, error, or panic (FR4). It
+// recovers a panic into the returned error, removes the worktree, posts at
+// most one failure comment (FR6), and releases the in_progress lock —
+// replacing it with blocked on failure (§4 step 7). Cleanup errors never
+// mask an earlier error; with no earlier error, the first cleanup failure
+// becomes the returned error.
+func execute(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.HerdrClient, issue github.Issue, runner execFunc) (err error) {
+	branch := fmt.Sprintf("factory/issue-%d", issue.Number)
+	agent := fmt.Sprintf("factory-issue-%d", issue.Number)
+
+	// Captured by the cleanup below and filled in as step 5 progresses: the
+	// workspace id arrives with the worktree, BEFORE Path is validated, so
+	// even a partially extracted WorktreeInfo is torn down.
+	var info herdr.WorktreeInfo
+	commentPosted := false
+
+	defer func() {
+		// Panic recovery: a panic becomes the run's error and falls through
+		// to the full cleanup — a crash must never leak a worktree or strand
+		// the lock, and it surfaces as an ordinary error to the caller.
+		if r := recover(); r != nil {
+			err = fmt.Errorf("pipeline: panic while executing issue #%d: %v", issue.Number, r)
+		}
+
+		// FR4(a) — remove the worktree on EVERY exit path, ahead of the
+		// GitHub mutations so a removal failure is still described by the
+		// comment below. RemoveWorktree also closes the workspace (herdr
+		// 0.9.3 contract), so there is no separate close step. No workspace
+		// id means CreateWorktree never delivered a handle: nothing to remove.
+		if info.WorkspaceID != "" {
+			if cerr := hd.RemoveWorktree(ctx, info.WorkspaceID); cerr != nil && err == nil {
+				err = fmt.Errorf("cleanup: remove worktree %s: %w", info.WorkspaceID, cerr)
+			}
+		}
+
+		// FR6 — exactly one failure comment per run: a single posting site,
+		// and the flag is set before the attempt, so no sequence of failures
+		// (including a failed comment post itself) can ever produce a second.
+		if err != nil && !commentPosted {
+			commentPosted = true
+			_ = gh.CommentOnIssue(ctx, issue.Number, failureComment(err))
+		}
+
+		// FR4(b) — release the lock on EVERY exit path. On success step 6
+		// already removed it and RemoveLabel is idempotent (a 404 returns
+		// nil), so this second release is a harmless no-op; on failure it is
+		// THE release. On success the state was already reached by step 6,
+		// so this verification call's error cannot change the outcome; on
+		// failure err is already set and it cannot mask that error either.
+		_ = gh.RemoveLabel(ctx, issue.Number, cfg.Labels.InProgress)
+
+		// §4 step 7 — replace the lock with the terminal blocked label, so
+		// the issue is visible, not re-claimed automatically, and left for a
+		// human (§6). A failed run is never left un-blocked.
+		if err != nil {
+			_ = gh.AddLabel(ctx, issue.Number, cfg.Labels.Blocked)
+		}
+	}()
+
+	// Step 5 — execute. Probe first: the plan's fail-fast check (Phase 4
+	// IMPORTANT). A down server must reach the error path as an error, never
+	// a panic from a call made against a dead session.
+	if err = hd.Probe(ctx); err != nil {
+		return fmt.Errorf("herdr probe: %w", err)
+	}
+
+	// The worktree for this issue: a dedicated branch off the configured
+	// base, created from the target repo's local clone.
+	info, err = hd.CreateWorktree(ctx, cfg.Worktree.Path, branch, cfg.Worktree.Base)
+	if err != nil {
+		return fmt.Errorf("create worktree: %w", err)
+	}
+	// Validate before driving the worktree: the Phase 4 live smoke pins
+	// Path, RootPaneID, and WorkspaceID as present, so an empty field means
+	// extraction failed and the run must not proceed on partial ids. The
+	// deferred cleanup above still removes it when WorkspaceID did arrive.
+	var missing []string
+	if info.Path == "" {
+		missing = append(missing, "Path")
+	}
+	if info.RootPaneID == "" {
+		missing = append(missing, "RootPaneID")
+	}
+	if info.WorkspaceID == "" {
+		missing = append(missing, "WorkspaceID")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("create worktree: incomplete WorktreeInfo (missing %s)",
+			strings.Join(missing, ", "))
+	}
+
+	// Split a pane down from the worktree's root pane, with the worktree
+	// checkout as its cwd, and start the agent in it. The agent name is
+	// derived from the issue number, so it is unique per run.
+	paneID, err := hd.SplitPane(ctx, info.RootPaneID, "down", info.Path)
+	if err != nil {
+		return fmt.Errorf("split pane: %w", err)
+	}
+	if err = hd.StartAgent(ctx, agent, cfg.Agent.Kind, paneID); err != nil {
+		return fmt.Errorf("start agent %s: %w", agent, err)
+	}
+
+	// PromptAgent ALONE: it already sends --wait and blocks until the agent
+	// settles, returning the settled status token. A second WaitAgent call
+	// would be redundant. Anything but "done" (never "idle" — see
+	// agentStatusDone) is a failure carrying the agent's diagnostic output.
+	status, err := hd.PromptAgent(ctx, agent, promptText(issue), cfg.Agent.Timeout)
+	if err != nil {
+		return withAgentOutput(ctx, hd, agent, fmt.Errorf("prompt agent %s: %w", agent, err))
+	}
+	if status != agentStatusDone {
+		return withAgentOutput(ctx, hd, agent,
+			fmt.Errorf("agent %s settled %q, want %q", agent, status, agentStatusDone))
+	}
+
+	// Step 5b — push the issue branch from the worktree checkout. A push
+	// failure is a run failure: step 6 opens the PR only from a branch that
+	// exists on the remote, so there is no partial success.
+	if err = pushBranch(ctx, runner, info.Path, branch); err != nil {
+		return err
+	}
+
+	// Step 6 — success: open the PR (with the closing keyword GitHub needs
+	// to close the issue on merge) and drop the lock label. Any failure here
+	// routes to the error path in the deferred cleanup. FR5: this package
+	// has no merge — ever.
+	if _, err = gh.CreatePR(ctx, github.PullRequestSpec{
+		Head:  branch,
+		Base:  cfg.Worktree.Base,
+		Title: issue.Title,
+		Body:  prBody(issue),
+	}); err != nil {
+		return fmt.Errorf("create PR: %w", err)
+	}
+	if err = gh.RemoveLabel(ctx, issue.Number, cfg.Labels.InProgress); err != nil {
+		return fmt.Errorf("release lock: %w", err)
+	}
 	return nil
+}
+
+// pushBranch pushes branch from the worktree checkout dir (never from the
+// lights-out repo itself) through the injected executor. On failure it
+// returns git's trimmed output so the error — and the single failure comment
+// built from it — carries the reason the push was rejected.
+func pushBranch(ctx context.Context, runner execFunc, dir, branch string) error {
+	out, err := runner(ctx, dir, "git", "push", "origin", branch)
+	if err == nil {
+		return nil
+	}
+	if msg := strings.TrimSpace(string(out)); msg != "" {
+		return fmt.Errorf("git push %s (in %s): %w: %s", branch, dir, err, msg)
+	}
+	return fmt.Errorf("git push %s (in %s): %w", branch, dir, err)
+}
+
+// runGit is the production execFunc: one command through
+// exec.CommandContext in the working directory dir, with stdout and stderr
+// combined — git push's diagnostics are only ever read as a single message.
+func runGit(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	return cmd.CombinedOutput()
+}
+
+// promptText is the agent's task: the issue's title and body (§4 step 5).
+func promptText(issue github.Issue) string {
+	if body := strings.TrimSpace(issue.Body); body != "" {
+		return issue.Title + "\n\n" + body
+	}
+	return issue.Title
+}
+
+// prBody is the PR description: the issue body followed by the closing
+// keyword, which is what makes GitHub close the issue when a human merges
+// the PR (§4 step 6; FR5 keeps the merge itself out of the factory's hands).
+func prBody(issue github.Issue) string {
+	var b strings.Builder
+	if body := strings.TrimSpace(issue.Body); body != "" {
+		b.WriteString(body)
+		b.WriteString("\n\n")
+	}
+	fmt.Fprintf(&b, "Closes #%d", issue.Number)
+	return b.String()
+}
+
+// failureComment is the body of the one comment FR6 allows per run: what
+// happened and why the run stopped (§4 step 7).
+func failureComment(err error) string {
+	return fmt.Sprintf("The dark factory stopped working on this issue:\n\n```\n%s\n```", err)
+}
+
+// withAgentOutput attaches the agent's recent output to cause so the single
+// failure comment carries the diagnostic body of §4 step 5. A failed read
+// degrades the message; it never replaces the original cause.
+func withAgentOutput(ctx context.Context, hd herdr.HerdrClient, agent string, cause error) error {
+	out, err := hd.ReadAgent(ctx, agent)
+	if err != nil {
+		return fmt.Errorf("%w (agent output unavailable: %v)", cause, err)
+	}
+	return fmt.Errorf("%w\nagent output:\n%s", cause, out)
 }
