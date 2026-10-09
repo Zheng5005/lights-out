@@ -54,8 +54,26 @@ agent:
   timeout: 15m
   # Herdr session the dispatcher targets. Default when omitted: default.
   session: default
+  # Extra arguments forwarded to the agent binary after `--` on `agent start`.
+  # The exact token "{worktree}" is replaced by the absolute checkout path of
+  # the run's worktree. For agy this pre-authorizes that directory: a fresh
+  # worktree triggers a project-trust dialog that otherwise blocks startup
+  # (agent_not_ready), and --add-dir suppresses it; --dangerously-skip-permissions
+  # auto-approves tool-permission requests, which an unmanned run requires.
+  args:
+    - "--add-dir"
+    - "{worktree}"
+    - "--dangerously-skip-permissions"
 
-# Git worktree settings used by the Phase 4 agent runner.
+# Git worktree settings used by the Phase 4 agent runner and the Phase 5
+# pipeline.
 worktree:
   # Base ref new worktrees are created from. Default when omitted: main.
   base: main
+  # Local clone of the target repository named in repo — not a clone of
+  # lights-out itself — that issue worktrees are created from. Required, no
+  # default. Not checked for existence at load time: config load validates
+  # config correctness, never environment existence (the runtime probe owns
+  # that). A leading "~" or "~/" expands to the home directory; the value must
+  # be an absolute path after expansion.
+  path: "/home/zheng5005/Documents/Projects/Spotify-clone-frontend-focus-"

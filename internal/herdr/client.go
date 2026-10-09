@@ -117,8 +117,9 @@ type HerdrClient interface {
 	// SplitPane splits paneID in direction with cwd as the new pane's working
 	// directory and returns the new pane's id.
 	SplitPane(ctx context.Context, paneID, direction, cwd string) (string, error)
-	// StartAgent starts an agent of kind inside paneID.
-	StartAgent(ctx context.Context, name, kind, paneID string) error
+	// StartAgent starts an agent of kind inside paneID. Any extraArgs are
+	// forwarded to the agent binary after an explicit `--` separator.
+	StartAgent(ctx context.Context, name, kind, paneID string, extraArgs ...string) error
 	// PromptAgent sends text to the target agent and returns its settled
 	// status token.
 	PromptAgent(ctx context.Context, target, text string, timeout time.Duration) (string, error)
@@ -330,13 +331,20 @@ func (c *Client) CreateWorktree(ctx context.Context, cwd, branch, base string) (
 
 // RemoveWorktree removes the worktree whose live workspace is identified by
 // workspaceID: the CLI takes NO positional argument, only
-// `worktree remove --workspace <id>`, because a worktree has no separate id
-// in 0.9.3 — the live workspace id IS the removal handle. Per the observed
-// 0.9.3 contract the same call also closes that workspace, so cleanup must
-// call this instead of a separate close; removal of an already-closed
-// workspace fails with workspace_not_found.
+// `worktree remove --workspace <id> --force`, because a worktree has no
+// separate id in 0.9.3 — the live workspace id IS the removal handle.
+//
+// The worktree is by definition disposable once its branch has been pushed
+// (or the run has failed), and a live agent may leave uncommitted or
+// untracked files behind, so removal must ALWAYS force. Without --force a
+// dirty worktree fails with dirty_worktree_requires_force; this matches the
+// Phase 4 pinned contract `worktree remove --workspace <id> --force`.
+//
+// Per the observed 0.9.3 contract the same call also closes that workspace,
+// so cleanup must call this instead of a separate close; removal of an
+// already-closed workspace fails with workspace_not_found.
 func (c *Client) RemoveWorktree(ctx context.Context, workspaceID string) error {
-	rest := []string{"worktree", "remove", "--workspace", workspaceID}
+	rest := []string{"worktree", "remove", "--workspace", workspaceID, "--force"}
 	_, err := c.execute(ctx, "worktree remove", rest...)
 	return err
 }
@@ -372,10 +380,20 @@ func (c *Client) SplitPane(ctx context.Context, paneID, direction, cwd string) (
 
 // StartAgent starts an agent named name of kind kind inside paneID. The
 // --pane flag is required: `agent start` never creates or splits panes
-// itself, so the pane must already exist (created by SplitPane). No timeout
-// flag is sent; the CLI's default 30s startup timeout applies.
-func (c *Client) StartAgent(ctx context.Context, name, kind, paneID string) error {
+// itself, so the pane must already exist (created by SplitPane). When
+// extraArgs are given they are appended after an explicit `--` separator, so
+// herdr 0.9.3 (`agent start <name> --kind <kind> --pane <id> [-- [AGENT_ARG]...]`)
+// forwards them to the agent binary; with no extraArgs no separator is sent.
+// The factory passes args that pre-authorize the run's worktree (agy
+// --add-dir suppresses the trust dialog, --dangerously-skip-permissions
+// auto-approves tool permissions). No timeout flag is sent; the CLI's default
+// 30s startup timeout applies.
+func (c *Client) StartAgent(ctx context.Context, name, kind, paneID string, extraArgs ...string) error {
 	rest := []string{"agent", "start", name, "--kind", kind, "--pane", paneID}
+	if len(extraArgs) > 0 {
+		rest = append(rest, "--")
+		rest = append(rest, extraArgs...)
+	}
 	_, err := c.execute(ctx, "agent start", rest...)
 	return err
 }

@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -82,11 +83,27 @@ type Agent struct {
 	Kind       string        `yaml:"kind"`       // e.g. "agy", "claude", "gemini"
 	Timeout    time.Duration // decoded from mirror; absent => default 15m
 	Session    string        `yaml:"session"` // Herdr session the dispatcher targets
+	// Args are extra arguments passed to the agent binary after `--` on
+	// `herdr agent start`. The exact token `{worktree}` is replaced by the
+	// run's absolute worktree path (the replacement happens in the pipeline
+	// at StartAgent time, not in config). Empty or absent means no extra
+	// args. For agy, `--add-dir {worktree}` suppresses the project-trust
+	// dialog and `--dangerously-skip-permissions` auto-approves tool
+	// permissions; both are required for an unmanned run.
+	Args []string `yaml:"args"`
 }
 
-// Worktree configures the Phase 4 worktree base ref (plan Open Decision #4).
+// Worktree configures where issue worktrees are created: the Phase 4 base ref
+// (plan Open Decision #4) and the repository they are created from.
 type Worktree struct {
 	Base string `yaml:"base"` // defaults to "main"
+	// Path is the local clone of the target repository named in repo — not a
+	// clone of lights-out itself — that issue worktrees are created from.
+	// Required with no default; "~" and "~/" expand to the user's home
+	// directory during Parse. Existence is deliberately not checked at load
+	// time: config load validates config correctness, never environment
+	// existence, so the run-time worktree probe owns that check.
+	Path string `yaml:"path"`
 }
 
 // ResolvePath returns the config file path: the value of EnvVar when it is set
@@ -102,6 +119,9 @@ func ResolvePath() string {
 // pointers so an explicitly configured zero is distinguishable from an absent
 // key: absent means "apply the default", explicit non-positive means the config
 // is wrong and must be reported instead of silently replaced by a default.
+// The worktree block needs no such mirror: worktree.path has no default, so an
+// absent key and an explicitly empty one are the same invalid state and the
+// pointer trick would have nothing to distinguish.
 type configFile struct {
 	Enabled          bool      `yaml:"enabled"`
 	Repo             string    `yaml:"repo"`
@@ -118,11 +138,12 @@ type configFile struct {
 // philosophy is preserved — an explicit "0s", negative, or garbage duration
 // fails loudly instead of silently falling back to the default.
 type agentFile struct {
-	Dispatcher string `yaml:"dispatcher"`
-	Mode       string `yaml:"mode"`
-	Kind       string `yaml:"kind"`
-	Timeout    string `yaml:"timeout"`
-	Session    string `yaml:"session"`
+	Dispatcher string   `yaml:"dispatcher"`
+	Mode       string   `yaml:"mode"`
+	Kind       string   `yaml:"kind"`
+	Timeout    string   `yaml:"timeout"`
+	Session    string   `yaml:"session"`
+	Args       []string `yaml:"args"` // verbatim; {worktree} expands in the pipeline
 }
 
 // Parse decodes a YAML document into a Config. Unknown fields are rejected so
@@ -147,12 +168,13 @@ func Parse(r io.Reader) (Config, error) {
 		Enabled:  file.Enabled,
 		Repo:     file.Repo,
 		Labels:   file.Labels,
-		Worktree: file.Worktree,
+		Worktree: Worktree{Base: file.Worktree.Base},
 		Agent: Agent{
 			Dispatcher: file.Agent.Dispatcher,
 			Mode:       file.Agent.Mode,
 			Kind:       file.Agent.Kind,
 			Session:    file.Agent.Session,
+			Args:       file.Agent.Args,
 		},
 	}
 	if err := assignTimeout("agent.timeout", file.Agent.Timeout, &cfg.Agent.Timeout); err != nil {
@@ -162,6 +184,9 @@ func Parse(r io.Reader) (Config, error) {
 		return Config{}, err
 	}
 	if err := assignLimit("daily_limit", file.DailyLimit, &cfg.DailyLimit); err != nil {
+		return Config{}, err
+	}
+	if err := assignPath("worktree.path", file.Worktree.Path, &cfg.Worktree.Path); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
@@ -196,6 +221,28 @@ func assignTimeout(key string, value string, dst *time.Duration) error {
 		return fmt.Errorf("%s must be greater than 0, got %v", key, parsed)
 	}
 	*dst = parsed
+	return nil
+}
+
+// assignPath expands an explicitly configured path into dst. A value that is
+// exactly "~" or starts with "~/" is resolved against the user's home
+// directory, so downstream validation only ever sees the expanded value. An
+// empty value means the key was absent (or explicitly empty) and dst stays
+// zero: worktree.path has no default, so Validate reports it instead of
+// silently substituting a path. Expansion that is required but impossible is
+// an authoring error that names the key.
+func assignPath(key string, value string, dst *string) error {
+	if value == "" {
+		return nil
+	}
+	if value == "~" || strings.HasPrefix(value, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("%s: cannot resolve home directory: %w", key, err)
+		}
+		value = filepath.Join(home, strings.TrimPrefix(value, "~"))
+	}
+	*dst = value
 	return nil
 }
 
@@ -261,6 +308,9 @@ func ResolveDefaults(c Config) Config {
 	if c.Worktree.Base == "" {
 		c.Worktree.Base = DefaultWorktreeBase
 	}
+	// worktree.path deliberately gets no default: it is required, so an
+	// absent key must fail validation instead of silently resolving to a
+	// path the operator never chose.
 	return c
 }
 
@@ -272,7 +322,11 @@ func ResolveDefaults(c Config) Config {
 //   - agent.timeout must be greater than zero,
 //   - labels.trigger, labels.in_progress, labels.blocked must be non-blank,
 //   - agent.dispatcher, agent.mode, agent.kind, agent.session and worktree.base
-//     must be non-blank.
+//     must be non-blank,
+//   - worktree.path must be non-blank and an absolute path (the "~" expansion
+//     already happened in Parse). Its existence is never checked here: config
+//     load validates config correctness, never environment existence — the
+//     run-time worktree probe owns that check.
 func Validate(c Config) error {
 	if err := validateRepo(c.Repo); err != nil {
 		return err
@@ -310,7 +364,10 @@ func Validate(c Config) error {
 	if err := validateNonBlank("agent.session", c.Agent.Session); err != nil {
 		return err
 	}
-	return validateNonBlank("worktree.base", c.Worktree.Base)
+	if err := validateNonBlank("worktree.base", c.Worktree.Base); err != nil {
+		return err
+	}
+	return validateWorktreePath(c.Worktree.Path)
 }
 
 func validateRepo(repo string) error {
@@ -327,6 +384,20 @@ func validateRepo(repo string) error {
 func validateNonBlank(key, value string) error {
 	if strings.TrimSpace(value) == "" {
 		return fmt.Errorf("%s must not be empty", key)
+	}
+	return nil
+}
+
+// validateWorktreePath enforces the worktree.path rules on the value Parse
+// already expanded: it must be non-blank and absolute. The filesystem is never
+// consulted — existence, git-repo-ness, and writability are run-time probe
+// concerns, not load-time ones.
+func validateWorktreePath(path string) error {
+	if err := validateNonBlank("worktree.path", path); err != nil {
+		return err
+	}
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("worktree.path must be an absolute path, got %q", path)
 	}
 	return nil
 }
