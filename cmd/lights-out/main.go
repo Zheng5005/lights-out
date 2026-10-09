@@ -5,12 +5,14 @@
 // 0 for a completed cycle — including the silent no-op exits, which are
 // specified behaviour — and 1 for a cycle that could not start or that failed.
 //
-// Phase 6 replaces this with the full CLI: structured step logging and the
-// --dry-run flag belong there, not here.
+// It is the full CLI: structured step logging through the stdlib slog text
+// handler on stderr, and the --dry-run flag, which walks the factory cycle
+// and logs what it would do without mutating anything.
 package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -35,6 +37,11 @@ func main() {
 // killed: FR4 requires the worktree removal and the lock release to happen
 // even when the cycle is stopped early.
 func run() int {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
+
+	dryRun := flag.Bool("dry-run", false, "walk the factory cycle and log what it would do without mutating anything")
+	flag.Parse()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -52,8 +59,16 @@ func run() int {
 	if err != nil {
 		return fail("resolve daily counter path", err)
 	}
+	counter := daily.New(counterPath)
 
-	if err := pipeline.Run(ctx, cfg, gh, herdr.New(cfg.Agent.Session), daily.New(counterPath)); err != nil {
+	if *dryRun {
+		if err := pipeline.DryRun(ctx, cfg, gh, counter); err != nil {
+			return fail("run factory cycle (dry-run)", err)
+		}
+		return 0
+	}
+
+	if err := pipeline.Run(ctx, cfg, gh, herdr.New(cfg.Agent.Session), counter); err != nil {
 		return fail("run factory cycle", err)
 	}
 	return 0
