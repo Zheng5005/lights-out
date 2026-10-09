@@ -128,19 +128,28 @@ Phase 6 task 1 of the plan (load config → init clients → `Run` → exit 0/1)
       small-model profile). Preflight STATUS inventory digest consumed
       read-only; its START was NOT executed (RDD off).
 
-### T4 — exit criteria: full verification + live read-only dry-run ⬜ PENDING
-- [ ] Full suite: `gofmt -l` clean, `go build ./...`, `go vet ./...`,
-      `go test ./...`, `go test -race ./...` — all green, count recorded.
-- [ ] Committed state: `./lights-out --dry-run` with `enabled: false` logs
-      `gate=disabled` and exits 0.
-- [ ] Full-path live dry-run (read-only): flip local `enabled: true` (uncommitted,
-      Phase 5 T8 precedent), run `./lights-out --dry-run` against the target repo
-      (`Zheng5005/Spotify-clone-frontend-focus-`), verify the logged transitions
-      (gate=passed, capacity, daily rolled to today, candidate=oldest or none) and
-      **zero mutation**: no label change on the candidate, counter file untouched,
-      no worktree in the clone. Restore `enabled: false`.
-- [ ] Update this document to ✅ with evidence, commit
-      `docs: record Phase 6 live dry-run verification`.
+### T4 — exit criteria: full verification + live read-only dry-run ✅ DONE (2026-10-09)
+- [x] Full suite in committed state: `gofmt -l` clean, `go build ./...` OK,
+      `go vet ./...` OK, `go test ./...` → **276 passed in 6 packages**,
+      `go test -race ./...` → **276 passed in 6 packages**.
+- [x] Committed-state `--dry-run` (template `enabled: false`): logs
+      `mode=dry-run` → `gate=disabled` → `would exit 0, no candidate`, **exit 0** —
+      Phase 6 semantics live: the disabled gate now announces itself and still
+      exits 0 with no dispatch.
+- [x] Full-path live dry-run (read-only): local `enabled: true` flip (uncommitted,
+      Phase 5 T8 precedent), binary against the target repo
+      (`Zheng5005/Spotify-clone-frontend-focus-`):
+      `mode=dry-run` → `gate=passed` → `capacity=ok (0/2)` → `daily=ok (0/2)`
+      (stale 10-08 counter rolled to 2026-10-09 **in memory**) → `candidate=none`
+      (verified live: #2 closed, #4 blocked, #3 lacks `dark-factory`) →
+      `would exit 0, no candidate`, **exit 0**.
+- [x] **Zero mutation proven (before/after):** labels unchanged on #4
+      (`dark-factory` + `factory-blocked`) and #3 (`good first issue`) — no
+      `in_progress` anywhere; daily counter content AND mtime byte-identical
+      (rolled date never persisted); target clone worktree list unchanged
+      (only `main`); no new PRs (only pre-existing #1, untouched).
+- [x] `enabled: false` restored; `git status` clean after the check.
+      Doc update committed with the evidence below.
 
 ## Open decisions
 
@@ -175,13 +184,14 @@ Phase 6 task 1 of the plan (load config → init clients → `Run` → exit 0/1)
 - ✅ T1 (`78ec9ae`) — step logging in pipeline (slog.Default; 268 tests green)
 - ✅ T2 (`ec6a647`) — CLI: slog handler (text, stderr, Info) + `--dry-run` flag
 - ✅ T3 (`5b5a163`) — `resolveClaim` extraction + `pipeline.DryRun` (276 tests green)
-- ⬜ T4 — exit criteria: full verification + live read-only dry-run
+- ✅ T4 — exit criteria verified live (2026-10-09): 276 + race green; both
+  dry-run paths proven against the real binary; zero mutation demonstrated
 
 ## Next step
 
-Implement T4: full exit-criteria verification (gofmt/build/vet/test/race),
-committed-state `--dry-run` with `enabled: false` (expect `gate=disabled`, exit 0),
-and the full-path live dry-run with a local uncommitted `enabled: true` — read-only
-against the target repo, zero mutation expected — then restore `enabled: false` and
-record the evidence. Housekeeping (optional): stale remote branch `factory/issue-2`
-on the target repo is unrelated to this phase.
+Phase 6 is functionally complete. **Delivery decision pending (ask-on-risk):**
+the running count of authored lines from the work-unit commits (~435 code + docs)
+exceeds the ~400 budget, so the strategy asks once — single phase-PR like
+Phase 4/5 (Phase 5 carried `size:exception`), or a chained-PR split. The user
+owns the timing of the push and PR. Housekeeping (optional): stale remote branch
+`factory/issue-2` on the target repo is unrelated to this phase.
