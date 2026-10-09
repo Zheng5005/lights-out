@@ -42,9 +42,10 @@ type execFunc func(ctx context.Context, dir, name string, args ...string) (outpu
 //
 // Silent nil exits are specified behaviour, not omissions: the disabled
 // gate, both capacity limits, and an empty candidate list return nil with
-// no log, no comment, and no side effect. Errors from the capacity, claim,
-// and lock steps are returned unchanged; each client already wraps its own
-// context, and a failed lock ends the cycle before any work starts.
+// no comment and no side effect (each announces itself with one Info log).
+// Errors from the capacity, claim, and lock steps are returned unchanged;
+// each client already wraps its own context, and a failed lock ends the
+// cycle before any work starts.
 //
 // Everything after the lock belongs to execute: the agent run in an
 // isolated worktree, the git push, the PR, and — on every exit path
@@ -62,54 +63,18 @@ func RunWithRunner(ctx context.Context, cfg config.Config, gh github.Client, hd 
 }
 
 // run is the shared body of Run and RunWithRunner: a straight-line
-// translation of doc/V1.md §4. Steps 2–4 (gate, capacity, claim, lock) live
-// here; steps 5–7 (execute, success, error) live in execute, whose single
-// defer wraps the whole post-lock section.
+// translation of doc/V1.md §4. The read-only decisions of steps 2–4 (gate,
+// capacity, claim) live in resolveClaim, which DryRun shares; the FR4 lock
+// and the post-lock steps 5–7 (execute, success, error) live here and in
+// execute, whose single defer wraps the whole post-lock section.
 func run(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.HerdrClient, daily *daily.Counter, runner execFunc) error {
-	// FR1 — gate. Checked before anything else; false means no action at all.
-	if !cfg.Enabled {
-		slog.Info("gate=disabled")
-		return nil
-	}
-	slog.Info("gate=passed")
-
-	// FR2 — concurrency capacity: open locks against the limit. The
-	// in-progress label doubles as the concurrency counter (§6), so the
-	// same label later applied as the lock is the one counted here.
-	inProgress, err := gh.CountIssuesByLabel(ctx, cfg.Labels.InProgress)
+	issue, ok, err := resolveClaim(ctx, cfg, gh, daily)
 	if err != nil {
 		return err
 	}
-	if inProgress >= cfg.ConcurrencyLimit {
-		slog.Info(fmt.Sprintf("capacity=full (%d/%d)", inProgress, cfg.ConcurrencyLimit))
+	if !ok {
 		return nil
 	}
-	slog.Info(fmt.Sprintf("capacity=ok (%d/%d)", inProgress, cfg.ConcurrencyLimit))
-
-	// FR3 — daily capacity. The UTC day boundary belongs to daily.Counter;
-	// Run only compares its reading against the configured limit.
-	claimedToday, err := daily.Current()
-	if err != nil {
-		return err
-	}
-	if claimedToday >= cfg.DailyLimit {
-		slog.Info(fmt.Sprintf("daily=reached (%d/%d)", claimedToday, cfg.DailyLimit))
-		return nil
-	}
-	slog.Info(fmt.Sprintf("daily=ok (%d/%d)", claimedToday, cfg.DailyLimit))
-
-	// Claim — candidates arrive oldest first (the github.Client contract),
-	// so the head of the list is the oldest eligible issue.
-	candidates, err := gh.ListClaimCandidates(ctx)
-	if err != nil {
-		return err
-	}
-	if len(candidates) == 0 {
-		slog.Info("candidate=none")
-		return nil
-	}
-	issue := candidates[0]
-	slog.Info(fmt.Sprintf("candidate=#%d", issue.Number))
 
 	// FR4 — the label is the lock, and the lock precedes the charge. If
 	// AddLabel fails the claim never took, so Increment must not run and
@@ -124,6 +89,87 @@ func run(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.Herd
 
 	// The lock holds: §4 steps 5–7 — execute, land, clean up.
 	return execute(ctx, cfg, gh, hd, issue, runner)
+}
+
+// resolveClaim runs the read-only decisions of doc/V1.md §4 steps 2–4 — the
+// FR1 gate, the FR2 concurrency capacity, the FR3 daily capacity, and the
+// oldest-candidate head selection — and returns the issue to claim, whether
+// the claim should proceed (ok), and the first error encountered.
+//
+// It mutates nothing: no label, no counter, no comment, no worktree. Run
+// continues to the FR4 lock after ok is true; DryRun stops there and reports
+// what a real run would have done.
+func resolveClaim(ctx context.Context, cfg config.Config, gh github.Client, daily *daily.Counter) (github.Issue, bool, error) {
+	// FR1 — gate. Checked before anything else; false means no action at all.
+	if !cfg.Enabled {
+		slog.Info("gate=disabled")
+		return github.Issue{}, false, nil
+	}
+	slog.Info("gate=passed")
+
+	// FR2 — concurrency capacity: open locks against the limit. The
+	// in-progress label doubles as the concurrency counter (§6), so the
+	// same label later applied as the lock is the one counted here.
+	inProgress, err := gh.CountIssuesByLabel(ctx, cfg.Labels.InProgress)
+	if err != nil {
+		return github.Issue{}, false, err
+	}
+	if inProgress >= cfg.ConcurrencyLimit {
+		slog.Info(fmt.Sprintf("capacity=full (%d/%d)", inProgress, cfg.ConcurrencyLimit))
+		return github.Issue{}, false, nil
+	}
+	slog.Info(fmt.Sprintf("capacity=ok (%d/%d)", inProgress, cfg.ConcurrencyLimit))
+
+	// FR3 — daily capacity. The UTC day boundary belongs to daily.Counter;
+	// resolveClaim only compares its reading against the configured limit.
+	claimedToday, err := daily.Current()
+	if err != nil {
+		return github.Issue{}, false, err
+	}
+	if claimedToday >= cfg.DailyLimit {
+		slog.Info(fmt.Sprintf("daily=reached (%d/%d)", claimedToday, cfg.DailyLimit))
+		return github.Issue{}, false, nil
+	}
+	slog.Info(fmt.Sprintf("daily=ok (%d/%d)", claimedToday, cfg.DailyLimit))
+
+	// Claim — candidates arrive oldest first (the github.Client contract),
+	// so the head of the list is the oldest eligible issue.
+	candidates, err := gh.ListClaimCandidates(ctx)
+	if err != nil {
+		return github.Issue{}, false, err
+	}
+	if len(candidates) == 0 {
+		slog.Info("candidate=none")
+		return github.Issue{}, false, nil
+	}
+	issue := candidates[0]
+	slog.Info(fmt.Sprintf("candidate=#%d", issue.Number))
+	return issue, true, nil
+}
+
+// DryRun walks the read-only decisions of one factory cycle — the FR1 gate,
+// the FR2 concurrency capacity, the FR3 daily capacity, and the
+// oldest-candidate head selection — and logs what a real run would do,
+// mutating nothing.
+//
+// It is read-only by construction and by signature: it has no Herdr client,
+// so it can never create a worktree, start an agent, or run a push; it calls
+// only the read-only github.Client methods (CountIssuesByLabel and
+// ListClaimCandidates) through resolveClaim; and it never applies a label,
+// charges the daily counter, posts a comment, or opens a PR. A claim that
+// would proceed is reported, never taken.
+func DryRun(ctx context.Context, cfg config.Config, gh github.Client, daily *daily.Counter) error {
+	slog.Info("mode=dry-run")
+	issue, ok, err := resolveClaim(ctx, cfg, gh, daily)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		slog.Info("would exit 0, no candidate")
+		return nil
+	}
+	slog.Info(fmt.Sprintf("would claim #%d (AddLabel, Increment, agent, push, PR skipped)", issue.Number))
+	return nil
 }
 
 // execute owns doc/V1.md §4 steps 5 through 7 — probe, worktree, agent,
