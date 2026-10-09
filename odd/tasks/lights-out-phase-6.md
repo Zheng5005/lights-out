@@ -83,33 +83,50 @@ Phase 6 task 1 of the plan (load config → init clients → `Run` → exit 0/1)
       selectorless preflight STATUS (`eligible_untracked_inventory`); the START
       it returned was NOT executed (RDD off).
 
-### T2 — CLI: slog handler setup + `--dry-run` flag in `cmd/lights-out/main.go` ⬜ PENDING
-- [ ] `slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, ...)))` at
-      `LevelInfo`, before any work; failures stay `Error` (existing `fail()`).
-- [ ] `flag.Bool("dry-run", ...)` → route to `pipeline.DryRun(ctx, cfg, gh, daily)`;
-      otherwise `pipeline.Run(...)`. Exit 0 on nil from either; 1 on error.
-      SIGINT/SIGTERM context wiring untouched.
-- [ ] Update the file-header comment that currently says "Phase 6 replaces this
-      with the full CLI" — it now *is* the CLI.
-- [ ] Work-unit commit: `feat(cli): structured logging and --dry-run flag` —
-      build/vet green; full suite still green.
+### T2 — CLI: slog handler setup + `--dry-run` flag in `cmd/lights-out/main.go` ✅ DONE — `ec6a647`
+> T2 and T3 were delegated as ONE writer unit (the flag routes to
+> `pipeline.DryRun`, which T3 creates — they only compile together) and
+> committed as two separate reviewable work units: pipeline first (`5b5a163`),
+> then the CLI (`ec6a647`). Precedent: Phase 5 T2+T3.
 
-### T3 — shared candidate selection + `pipeline.DryRun` ⬜ PENDING
-- [ ] Extract `resolveClaim(ctx, cfg, gh, daily) (github.Issue, bool, error)` — the
-      gate + capacity + daily + head-of-list body of `run()` (lines 68–103 today).
-      `run()` calls it, then keeps its pinned sequence: `AddLabel` → `Increment` →
-      `execute`. Existing exact-sequence tests must pass unmodified.
-- [ ] `pipeline.DryRun(ctx, cfg, gh, daily) error`: run `resolveClaim`, log
-      `mode=dry-run` and what would happen — candidate: `would claim #N (AddLabel,
-      Increment, agent, push, PR skipped)`; silent exit: `would exit 0, no candidate`;
-      propagate errors like `run()` does.
-- [ ] Tests (same-package, fake `github.Client` like the existing suite): disabled
-      gate (no gh calls at all), capacity full, daily reached, empty candidates,
-      candidate selected (asserts `AddLabel` and `Increment` are **never** called
-      and the would-claim line is logged), error propagation. The signature
-      (no herdr) makes the "never touches herdr" constraint structural.
-- [ ] Work-unit commit: `feat(pipeline): dry-run mode sharing candidate selection` —
-      suite green.
+- [x] `slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, ...)))` at
+      `LevelInfo`, first line of `run()`, before any work; failures stay
+      `Error` (existing `fail()`).
+- [x] `flag.Bool("dry-run", ...)` + `flag.Parse()`; `dry-run` routes to
+      `pipeline.DryRun(ctx, cfg, gh, counter)` with fail step
+      `"run factory cycle (dry-run)"`; otherwise the existing `pipeline.Run`
+      path. Exit 0 on nil from either; 1 on error. SIGINT/SIGTERM context
+      wiring untouched. In dry-run mode the herdr client is never constructed.
+- [x] File-header comment rewritten — it *is* the full CLI now.
+- [x] Work-unit commit `ec6a647` — build/vet green; full suite green (276 tests).
+
+### T3 — shared candidate selection + `pipeline.DryRun` ✅ DONE — `5b5a163`
+- [x] `resolveClaim(ctx, cfg, gh, daily) (github.Issue, bool, error)` extracted
+      from `run()` — the FR1 gate, FR2 capacity, FR3 daily, and head-of-list
+      selection, preserving every log line and client-call order byte for byte.
+      `run()` keeps the pinned FR4 sequence (`AddLabel` → `lock=applied` →
+      `Increment` → `execute`); existing exact-sequence tests pass UNMODIFIED.
+- [x] `pipeline.DryRun(ctx, cfg, gh, daily) error`: logs `mode=dry-run`, walks
+      `resolveClaim`, logs `would exit 0, no candidate` or `would claim #N
+      (AddLabel, Increment, agent, push, PR skipped)`; propagates errors.
+      Read-only by signature — no herdr parameter, so no worktree/agent/push is
+      structurally possible.
+- [x] Tests (`internal/pipeline/dryrun_test.go`, package pipeline_test, reusing
+      fakeGitHub/callSeq/captureLog/newTestCounter): disabled gate (zero gh
+      calls), capacity full, daily reached, empty candidates, candidate
+      selected (event list stops at `ListClaimCandidates` — no AddLabel, no
+      charge), plus CountIssuesByLabel and ListClaimCandidates error
+      propagation. TDD: RED = `undefined: pipeline.DryRun` build failure;
+      GREEN = 44 passed in the package.
+- [x] Work-unit commit `5b5a163` — suite green (gofmt clean, build/vet OK,
+      276 tests in 6 packages = 268 + 8 new, `-race` green).
+- [x] RDD off (user-owned) → parent verification gate: native assess over the
+      writer diff = **medium** (`executable_change` on `cmd/lights-out/main.go`),
+      `review_due: false` (`under_budget`); tier medium → writer
+      self-verification + parent spot check (gofmt re-run clean, 44 pipeline
+      tests re-run green; full diff read back). No independent verifier (no
+      small-model profile). Preflight STATUS inventory digest consumed
+      read-only; its START was NOT executed (RDD off).
 
 ### T4 — exit criteria: full verification + live read-only dry-run ⬜ PENDING
 - [ ] Full suite: `gofmt -l` clean, `go build ./...`, `go vet ./...`,
@@ -156,15 +173,15 @@ Phase 6 task 1 of the plan (load config → init clients → `Run` → exit 0/1)
 ## Progress
 
 - ✅ T1 (`78ec9ae`) — step logging in pipeline (slog.Default; 268 tests green)
-- ⬜ T2 — CLI: handler setup + `--dry-run` flag
-- ⬜ T3 — `resolveClaim` extraction + `pipeline.DryRun`
+- ✅ T2 (`ec6a647`) — CLI: slog handler (text, stderr, Info) + `--dry-run` flag
+- ✅ T3 (`5b5a163`) — `resolveClaim` extraction + `pipeline.DryRun` (276 tests green)
 - ⬜ T4 — exit criteria: full verification + live read-only dry-run
 
 ## Next step
 
-Implement T2: `slog.SetDefault` handler setup (text, stderr, Info) and the
-`--dry-run` flag in `cmd/lights-out/main.go`, routing to `pipeline.DryRun`
-(landing in T3). Housekeeping (optional): the stale remote branch
-`factory/issue-2` on the target repo is unrelated to this phase; `config.yaml`
-stays `enabled: false` in the committed template, and the live dry-run arm (T4)
-stays uncommitted like Phase 5 T8.
+Implement T4: full exit-criteria verification (gofmt/build/vet/test/race),
+committed-state `--dry-run` with `enabled: false` (expect `gate=disabled`, exit 0),
+and the full-path live dry-run with a local uncommitted `enabled: true` — read-only
+against the target repo, zero mutation expected — then restore `enabled: false` and
+record the evidence. Housekeeping (optional): stale remote branch `factory/issue-2`
+on the target repo is unrelated to this phase.
