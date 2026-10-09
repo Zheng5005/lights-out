@@ -6,6 +6,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os/exec"
 	"strings"
 
@@ -67,8 +68,10 @@ func RunWithRunner(ctx context.Context, cfg config.Config, gh github.Client, hd 
 func run(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.HerdrClient, daily *daily.Counter, runner execFunc) error {
 	// FR1 — gate. Checked before anything else; false means no action at all.
 	if !cfg.Enabled {
+		slog.Info("gate=disabled")
 		return nil
 	}
+	slog.Info("gate=passed")
 
 	// FR2 — concurrency capacity: open locks against the limit. The
 	// in-progress label doubles as the concurrency counter (§6), so the
@@ -78,8 +81,10 @@ func run(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.Herd
 		return err
 	}
 	if inProgress >= cfg.ConcurrencyLimit {
+		slog.Info(fmt.Sprintf("capacity=full (%d/%d)", inProgress, cfg.ConcurrencyLimit))
 		return nil
 	}
+	slog.Info(fmt.Sprintf("capacity=ok (%d/%d)", inProgress, cfg.ConcurrencyLimit))
 
 	// FR3 — daily capacity. The UTC day boundary belongs to daily.Counter;
 	// Run only compares its reading against the configured limit.
@@ -88,8 +93,10 @@ func run(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.Herd
 		return err
 	}
 	if claimedToday >= cfg.DailyLimit {
+		slog.Info(fmt.Sprintf("daily=reached (%d/%d)", claimedToday, cfg.DailyLimit))
 		return nil
 	}
+	slog.Info(fmt.Sprintf("daily=ok (%d/%d)", claimedToday, cfg.DailyLimit))
 
 	// Claim — candidates arrive oldest first (the github.Client contract),
 	// so the head of the list is the oldest eligible issue.
@@ -98,9 +105,11 @@ func run(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.Herd
 		return err
 	}
 	if len(candidates) == 0 {
+		slog.Info("candidate=none")
 		return nil
 	}
 	issue := candidates[0]
+	slog.Info(fmt.Sprintf("candidate=#%d", issue.Number))
 
 	// FR4 — the label is the lock, and the lock precedes the charge. If
 	// AddLabel fails the claim never took, so Increment must not run and
@@ -108,6 +117,7 @@ func run(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.Herd
 	if err := gh.AddLabel(ctx, issue.Number, cfg.Labels.InProgress); err != nil {
 		return err
 	}
+	slog.Info(fmt.Sprintf("lock=applied (#%d)", issue.Number))
 	if _, err := daily.Increment(); err != nil {
 		return err
 	}
@@ -177,6 +187,12 @@ func execute(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.
 		if err != nil {
 			_ = gh.AddLabel(ctx, issue.Number, cfg.Labels.Blocked)
 		}
+
+		// Success only: the failure path already reports through the
+		// returned error and the single FR6 comment above.
+		if err == nil {
+			slog.Info("cleanup=ok (worktree removed, lock released)")
+		}
 	}()
 
 	// Step 5 — execute. Probe first: the plan's fail-fast check (Phase 4
@@ -210,6 +226,7 @@ func execute(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.
 		return fmt.Errorf("create worktree: incomplete WorktreeInfo (missing %s)",
 			strings.Join(missing, ", "))
 	}
+	slog.Info(fmt.Sprintf("worktree=ready (workspace %s)", info.WorkspaceID))
 
 	// Split a pane down from the worktree's root pane, with the worktree
 	// checkout as its cwd, and start the agent in it. The agent name is
@@ -228,6 +245,7 @@ func execute(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.
 	if err = hd.StartAgent(ctx, agent, cfg.Agent.Kind, paneID, agentArgs(cfg.Agent.Args, info.Path)...); err != nil {
 		return fmt.Errorf("start agent %s: %w", agent, err)
 	}
+	slog.Info("agent=started")
 
 	// PromptAgent ALONE: it already sends --wait and blocks until the agent
 	// settles, returning the settled status token. A second WaitAgent call
@@ -237,6 +255,7 @@ func execute(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.
 	if err != nil {
 		return withAgentOutput(ctx, hd, agent, fmt.Errorf("prompt agent %s: %w", agent, err))
 	}
+	slog.Info(fmt.Sprintf("agent=settled %s", status))
 	if status != agentStatusDone {
 		return withAgentOutput(ctx, hd, agent,
 			fmt.Errorf("agent %s settled %q, want %q", agent, status, agentStatusDone))
@@ -257,6 +276,7 @@ func execute(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.
 	if err = pushBranch(ctx, runner, info.Path, branch); err != nil {
 		return err
 	}
+	slog.Info(fmt.Sprintf("push=ok (branch %s)", branch))
 
 	// Step 6 — success: open the PR (with the closing keyword GitHub needs
 	// to close the issue on merge) and drop the lock label. Any failure here
@@ -270,6 +290,7 @@ func execute(ctx context.Context, cfg config.Config, gh github.Client, hd herdr.
 	}); err != nil {
 		return fmt.Errorf("create PR: %w", err)
 	}
+	slog.Info(fmt.Sprintf("pr=opened (#%d)", issue.Number))
 	if err = gh.RemoveLabel(ctx, issue.Number, cfg.Labels.InProgress); err != nil {
 		return fmt.Errorf("release lock: %w", err)
 	}
