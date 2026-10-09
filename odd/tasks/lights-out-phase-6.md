@@ -52,22 +52,36 @@ Phase 6 task 1 of the plan (load config → init clients → `Run` → exit 0/1)
 
 ## Tasks
 
-### T1 — step-transition logging in `internal/pipeline` (via `slog.Default()`) ⬜ PENDING
-- [ ] Transitions logged at `Info` in `run()`: `gate=passed` / `gate=disabled` (FR1,
+### T1 — step-transition logging in `internal/pipeline` (via `slog.Default()`) ✅ DONE — `78ec9ae`
+- [x] Transitions logged at `Info` in `run()`: `gate=passed` / `gate=disabled` (FR1,
       still exit 0, still no dispatch), `capacity=ok (n/m)` / `capacity=full (n/m)`,
       `daily=ok (n/m)` / `daily=reached (n/m)`, `candidate=#N` (head of list),
       `candidate=none`.
-- [ ] Transitions logged in `execute()`: `lock=applied`, `worktree=ready
+- [x] Transitions logged in `execute()`: `lock=applied`, `worktree=ready
       (workspace <id>)`, `agent=started`, `agent=settled <status>`, `push=ok
       (branch <b>)`, `pr=opened (#<n>)`, `cleanup=ok (worktree removed, lock released)`.
-- [ ] No signature changes; each statement is pure logging next to the existing
-      decisions. The FR1/FR4/FR6 test suites are not altered in their assertions.
-- [ ] Tests: silence the default logger in `pipeline_test.go` (TestMain →
-      `slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))`) so the
-      suite output stays clean; add one capture test that points `slog.Default()`
-      at a buffer and asserts a transition line (e.g. `capacity=ok (1/2)`).
-- [ ] Work-unit commit: `feat(pipeline): log every step transition` — suite green
-      (gofmt/build/vet/test/race).
+      `cleanup=ok` is guarded by `err == nil` inside the defer — success path only;
+      the failure path reports through the returned error and the FR6 comment.
+- [x] No signature changes; each statement is pure logging next to the existing
+      decisions. The FR1/FR4/FR6 test suites pass with their assertions UNCHANGED.
+      Diff is insertions + import only (21 lines in `pipeline.go`, zero
+      reordering — parent verified the full diff).
+- [x] Tests: `TestMain` in the package silences the default logger suite-wide
+      (`slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))`); new
+      `logging_test.go` has a strict-RED capture test (4 subtests: silent-exit
+      lines, disabled-gate-only, full-cycle line set through cleanup, failure
+      path with `cleanup=ok` absent). RED observed: `"" does not contain
+      "gate=passed"` (5 failed); GREEN: 36 passed. `pipeline_test.go` untouched.
+- [x] Work-unit commit `78ec9ae` — suite green (gofmt clean, build/vet OK,
+      268 tests in 6 packages = 263 base + 5 new, `-race` green).
+- [x] RDD off (user-owned) → parent verification gate: native assess over the
+      writer diff = **medium** (`executable_change` on `logging_test.go`),
+      `review_due: false` (`under_budget`); tier medium → writer self-verification
+      + parent spot check (gofmt re-run clean, `go test ./internal/pipeline/...`
+      → 36 passed). No independent verifier required (no small-model profile).
+      Note: assess needed the canonical untracked inventory digest from the
+      selectorless preflight STATUS (`eligible_untracked_inventory`); the START
+      it returned was NOT executed (RDD off).
 
 ### T2 — CLI: slog handler setup + `--dry-run` flag in `cmd/lights-out/main.go` ⬜ PENDING
 - [ ] `slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, ...)))` at
@@ -141,15 +155,16 @@ Phase 6 task 1 of the plan (load config → init clients → `Run` → exit 0/1)
 
 ## Progress
 
-- ⬜ T1 — step logging in pipeline (slog.Default)
+- ✅ T1 (`78ec9ae`) — step logging in pipeline (slog.Default; 268 tests green)
 - ⬜ T2 — CLI: handler setup + `--dry-run` flag
 - ⬜ T3 — `resolveClaim` extraction + `pipeline.DryRun`
 - ⬜ T4 — exit criteria: full verification + live read-only dry-run
 
 ## Next step
 
-Cut `feat/phase-6-cli` from `main` (`7ca6edc`) and implement T1 (step logging),
-then T2 → T3 → T4 with a work-unit commit per task. Housekeeping (optional): the
-stale remote branch `factory/issue-2` on the target repo is unrelated to this
-phase; `config.yaml` stays `enabled: false` in the committed template, and the
-live dry-run arm (T4) stays uncommitted like Phase 5 T8.
+Implement T2: `slog.SetDefault` handler setup (text, stderr, Info) and the
+`--dry-run` flag in `cmd/lights-out/main.go`, routing to `pipeline.DryRun`
+(landing in T3). Housekeeping (optional): the stale remote branch
+`factory/issue-2` on the target repo is unrelated to this phase; `config.yaml`
+stays `enabled: false` in the committed template, and the live dry-run arm (T4)
+stays uncommitted like Phase 5 T8.
